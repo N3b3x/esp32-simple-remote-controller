@@ -21,13 +21,13 @@
  * IMPORTANT: Configure the GPIO pin numbers below to match your hardware wiring!
  * 
  * ESP32C6 Beetle Board Pin Reference:
- * - GPIO 4: CONFIRM button
- * - GPIO 5: I2C SDA
- * - GPIO 6: BACK button
- * - GPIO 7: Encoder TRB (Phase B)
- * - GPIO 21: Encoder TRA (Phase A)
- * - GPIO 22: Encoder push button
- * - GPIO 23: I2C SCL
+ * - GPIO 4:  CONFIRM button (LP-capable, can wake from deep sleep)
+ * - GPIO 5:  Encoder push button (PSH / SW) (LP-capable, can wake from deep sleep)
+ * - GPIO 6:  BACK button (LP-capable, can wake from deep sleep)
+ * - GPIO 7:  Encoder TRA (Phase A / CLK) (LP-capable, can wake from deep sleep)
+ * - GPIO 21: Encoder TRB (Phase B / DT)
+ * - GPIO 22: I2C SCL (OLED)
+ * - GPIO 23: I2C SDA (OLED)
  */
 
 #pragma once
@@ -40,7 +40,7 @@
 
 // I2C bus configuration for OLED display
 static constexpr i2c_port_t OLED_I2C_PORT_ = I2C_NUM_0;  // Use I2C0
-static constexpr gpio_num_t OLED_SDA_PIN_  = GPIO_NUM_5;   // I2C Data line (SDA)
+static constexpr gpio_num_t OLED_SDA_PIN_  = GPIO_NUM_22;   // I2C Data line (SDA)
 static constexpr gpio_num_t OLED_SCL_PIN_  = GPIO_NUM_23;  // I2C Clock line (SCL)
 static constexpr uint32_t   OLED_I2C_FREQ_ = 400000;      // I2C frequency: 400kHz (fast mode)
 static constexpr uint8_t    OLED_I2C_ADDR_ = 0x3C;        // SH1106 I2C address (try 0x3D if 0x3C doesn't work)
@@ -52,9 +52,9 @@ static constexpr uint16_t OLED_HEIGHT_ = 64;
 // ------------- EC11 ROTARY ENCODER CONFIG -------------
 
 // EC11 encoder pins (must support GPIO interrupts)
-static constexpr gpio_num_t ENCODER_TRA_PIN_ = GPIO_NUM_21;  // Phase A (CLK) - quadrature input
-static constexpr gpio_num_t ENCODER_TRB_PIN_ = GPIO_NUM_7;   // Phase B (DT) - quadrature input
-static constexpr gpio_num_t ENCODER_PSH_PIN_ = GPIO_NUM_22;  // Push button (SW) - encoder click
+static constexpr gpio_num_t ENCODER_TRA_PIN_ = GPIO_NUM_7;  // Phase A (CLK) - quadrature input
+static constexpr gpio_num_t ENCODER_TRB_PIN_ = GPIO_NUM_21;   // Phase B (DT) - quadrature input
+static constexpr gpio_num_t ENCODER_PSH_PIN_ = GPIO_NUM_5;  // Push button (SW) - encoder click
 
 // Encoder configuration
 static constexpr uint8_t ENCODER_PULSES_PER_REV_ = 20;      // 20 pulses per full rotation
@@ -75,7 +75,7 @@ static constexpr uint32_t BUTTON_DEBOUNCE_MS_ = 50;           // Debounce time f
 
 // Placeholder MAC of the test unit (receiver). Fill with real MAC later.
 // This should be set to the MAC address of your test unit ESP32
-static constexpr uint8_t TEST_UNIT_MAC_[6] = { 0x24, 0x6F, 0x28, 0x00, 0x00, 0x01 };
+static constexpr uint8_t TEST_UNIT_MAC_[6] = { 0xFC, 0x01, 0x2C, 0xFF, 0xE4, 0xDC };
 
 // ------------- APP LOGIC -------------
 

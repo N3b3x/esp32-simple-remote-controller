@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -25,9 +26,11 @@ FatigueTester::FatigueTester(Adafruit_SH1106* display, Settings* settings) noexc
     , current_cycle_(0)
     , error_code_(0)
     , popup_active_(false)
-    , popup_type_(0)
-    , popup_yes_selected_(false)
+    , popup_mode_(PopupMode::None)
+    , popup_selected_index_(0)
     , settings_synced_(false)
+    , pending_command_id_(0)
+    , pending_command_tick_(0)
     , menu_active_(false)
     , menu_selected_index_(0)
     , editing_value_(false)
@@ -36,14 +39,41 @@ FatigueTester::FatigueTester(Adafruit_SH1106* display, Settings* settings) noexc
     , error_count_(0)
     , confirm_hold_start_(0)
     , confirm_held_(false)
+    , log_lines_{}
+    , log_head_(0)
+    , last_logged_state_(device_protocols::FatigueTestState::Idle)
+    , last_logged_cycle_(0)
+    , last_logged_error_code_(0)
+    , not_connected_flash_until_tick_(0)
 {
     // Initialize error array
     for (size_t i = 0; i < MAX_ERRORS_; ++i) {
         errors_[i] = {0, 0, 0};
     }
+
+    // Init log buffer
+    for (uint8_t i = 0; i < LOG_LINES_; ++i) {
+        log_lines_[i][0] = '\0';
+    }
+    pushLogLine("Boot: requesting...");
     
     // Request initial config from device
     RequestStatus();
+}
+
+void FatigueTester::pushLogLine(const char* fmt, ...) noexcept
+{
+    if (!fmt) return;
+
+    char buf[LOG_LINE_CHARS_]{};
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    // Write into ring buffer
+    std::snprintf(log_lines_[log_head_], LOG_LINE_CHARS_, "%s", buf);
+    log_head_ = static_cast<uint8_t>((log_head_ + 1) % LOG_LINES_);
 }
 
 uint8_t FatigueTester::GetDeviceId() const noexcept
@@ -85,54 +115,46 @@ void FatigueTester::RenderMainScreen() noexcept
         display_->drawLine(122, 4, 118, 8, 0);
     }
     
-    // Main Status Display (large, centered)
+    // Body: state summary + small "log window" in the area that used to show big OFFLINE text.
     display_->setTextColor(1);
-    display_->setTextSize(2); // Large text for status
-    
-    const char* status_text = "";
-    if (current_state_ == device_protocols::FatigueTestState::Running) {
-        status_text = "RUNNING";
-    } else if (current_state_ == device_protocols::FatigueTestState::Paused) {
-        status_text = "PAUSED";
-    } else if (current_state_ == device_protocols::FatigueTestState::Completed) {
-        status_text = "DONE";
-    } else if (current_state_ == device_protocols::FatigueTestState::Error) {
-        status_text = "ERROR";
-    } else {
-        // Idle state - show connection/sync status
-        if (connected && settings_synced_) {
-            status_text = "READY";
-        } else if (connected) {
-            status_text = "SYNCING";
-        } else {
-            status_text = "OFFLINE";
-        }
+    display_->setTextSize(1);
+
+    const char* state_str = "IDLE";
+    switch (current_state_) {
+        case device_protocols::FatigueTestState::Running:   state_str = "RUN"; break;
+        case device_protocols::FatigueTestState::Paused:    state_str = "PAUSE"; break;
+        case device_protocols::FatigueTestState::Completed: state_str = "DONE"; break;
+        case device_protocols::FatigueTestState::Error:     state_str = "ERR"; break;
+        default: state_str = "IDLE"; break;
     }
-    
-    // Center the status text
-    int16_t x1, y1;
-    uint16_t w, h;
-    display_->getTextBounds(status_text, 0, 0, &x1, &y1, &w, &h);
-    display_->setCursor((128 - w) / 2, 25);
-    display_->print(status_text);
-    
-    // If running or paused, show cycle progress
-    if (current_state_ == device_protocols::FatigueTestState::Running || 
-        current_state_ == device_protocols::FatigueTestState::Paused) {
-        display_->setTextSize(1);
-        display_->setCursor(0, 40);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "Cycle: %lu / %lu", 
-                 (unsigned long)current_cycle_, 
+
+    // Top row (y=14): state + cycle summary (or offline/sync)
+    display_->setCursor(0, 14);
+    if (!connected) {
+        display_->print("OFFLINE");
+    } else if (!settings_synced_) {
+        display_->print("SYNCING");
+    } else {
+        char top[32];
+        snprintf(top, sizeof(top), "%s %lu/%lu",
+                 state_str,
+                 (unsigned long)current_cycle_,
                  (unsigned long)settings_->fatigue_test.cycle_amount);
-        display_->print(buf);
-    } else if (current_state_ == device_protocols::FatigueTestState::Error) {
-        // Show error code
-        display_->setTextSize(1);
-        display_->setCursor(0, 40);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "Error: %d", error_code_);
-        display_->print(buf);
+        display_->print(top);
+    }
+
+    // Log window frame (y=24..51)
+    display_->drawRect(0, 24, 128, 28, 1);
+
+    // Render last LOG_LINES_ messages, newest at bottom
+    // Line Y positions: 26, 34, 42 (text size 1 => 8px height)
+    for (uint8_t i = 0; i < LOG_LINES_; ++i) {
+        uint8_t idx = static_cast<uint8_t>((log_head_ + LOG_LINES_ - 1 - i) % LOG_LINES_);
+        const char* line = log_lines_[idx];
+        if (!line || line[0] == '\0') continue;
+        int y = 42 - (i * 8);
+        display_->setCursor(2, y);
+        display_->print(line);
     }
     
     // Navigation hints (small, at bottom)
@@ -157,102 +179,102 @@ void FatigueTester::RenderControlScreen() noexcept
     vTaskDelay(pdMS_TO_TICKS(5));
     
     display_->clearDisplay();
-    
-    // Header
-    if (current_state_ == device_protocols::FatigueTestState::Running) {
-        display_->fillRect(0, 0, 128, 12, 1);
-        display_->setTextColor(0);
-        display_->setTextSize(1);
-        display_->setCursor(40, 2);
-        display_->print("RUNNING");
-        
-        // Data
-        display_->setTextColor(1);
-        display_->setTextSize(2);
-        
-        // Center the cycle count
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)current_cycle_);
-        int16_t x1, y1;
-        uint16_t w, h;
-        display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-        display_->setCursor((128 - w) / 2, 25);
-        display_->print(buf);
-        
-        display_->setTextSize(1);
-        display_->setCursor(20, 45);
-        display_->print("Target: ");
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)settings_->fatigue_test.cycle_amount);
-        display_->print(buf);
-    } else if (current_state_ == device_protocols::FatigueTestState::Paused) {
-        display_->drawRect(0, 0, 128, 12, 1);
-        display_->setTextColor(1);
-        display_->setTextSize(1);
-        display_->setCursor(45, 2);
-        display_->print("PAUSED");
-        
-        // Data
-        display_->setTextSize(2);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)current_cycle_);
-        int16_t x1, y1;
-        uint16_t w, h;
-        display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-        display_->setCursor((128 - w) / 2, 25);
-        display_->print(buf);
-        
-        display_->setTextSize(1);
-        display_->setCursor(20, 45);
-        display_->print("Target: ");
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)settings_->fatigue_test.cycle_amount);
-        display_->print(buf);
-    } else if (current_state_ == device_protocols::FatigueTestState::Completed) {
-        display_->clearDisplay();
-        display_->setTextSize(1);
-        display_->setTextColor(1);
-        
-        // Title
-        display_->setCursor(20, 0);
-        display_->print("Test Complete");
-        
-        // Final cycle count
-        display_->setCursor(0, 20);
-        display_->print("Total Cycles: ");
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)current_cycle_);
-        display_->print(buf);
-    } else if (current_state_ == device_protocols::FatigueTestState::Error) {
-        display_->clearDisplay();
-        display_->setTextSize(1);
-        display_->setTextColor(1);
-        
-        // Title
-        display_->setCursor(30, 0);
-        display_->print("ERROR");
-        
-        // Error code
-        display_->setCursor(0, 20);
-        display_->print("Code: ");
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d", error_code_);
-        display_->print(buf);
-    } else {
-        // Idle - show start prompt
-        display_->clearDisplay();
-        display_->setTextSize(1);
-        display_->setTextColor(1);
-        display_->setCursor(0, 0);
-        display_->print("Control");
-        display_->drawLine(0, 9, 128, 9, 1);
-        display_->setCursor(0, 12);
-        display_->print("Press CONFIRM");
-        display_->setCursor(0, 24);
-        display_->print("to start");
+
+    // Unified, strict 128x64 layout:
+    // - Header: y=0..11
+    // - Body:   y=12..51
+    // - Footer: y=52..63
+
+    TickType_t now_ticks = xTaskGetTickCount();
+    bool connected = (last_status_tick_ > 0) && (now_ticks - last_status_tick_ < pdMS_TO_TICKS(5000));
+    bool cmd_pending = (pending_command_id_ != 0) && (now_ticks - pending_command_tick_ < pdMS_TO_TICKS(2000));
+    if (!cmd_pending && pending_command_id_ != 0) {
+        pending_command_id_ = 0;
+        pending_command_tick_ = 0;
     }
-    
-    // Error footer (if errors exist and meet severity threshold)
-    renderErrorFooter();
-    
+
+    // Header bar (inverted)
+    display_->fillRect(0, 0, 128, 12, 1);
+    display_->setTextColor(0);
+    display_->setTextSize(1);
+    display_->setCursor(2, 2);
+    display_->print("TEST");
+
+    // State tag (right side)
+    const char* state_tag = "IDLE";
+    switch (current_state_) {
+        case device_protocols::FatigueTestState::Running: state_tag = "RUN"; break;
+        case device_protocols::FatigueTestState::Paused: state_tag = "PAUSE"; break;
+        case device_protocols::FatigueTestState::Completed: state_tag = "DONE"; break;
+        case device_protocols::FatigueTestState::Error: state_tag = "ERR"; break;
+        default: state_tag = "IDLE"; break;
+    }
+    display_->setCursor(86, 2);
+    display_->print(state_tag);
+    if (cmd_pending) {
+        display_->setCursor(110, 2);
+        display_->print("...");
+    }
+
+    // Connection dot (far right)
+    if (connected) {
+        display_->fillCircle(124, 6, 2, 0);
+    } else {
+        display_->drawCircle(124, 6, 2, 0);
+    }
+
+    // Body
+    display_->setTextColor(1);
+
+    // Small status line (y=14) with optional "flash" feedback when user tries actions while offline
+    display_->setTextSize(1);
+    const bool flash_nc = (!connected && not_connected_flash_until_tick_ != 0 && now_ticks < not_connected_flash_until_tick_);
+    if (flash_nc) {
+        // Invert the line to make it obvious
+        display_->fillRect(0, 12, 128, 10, 1);
+        display_->setTextColor(0);
+    } else {
+        display_->setTextColor(1);
+    }
+    display_->setCursor(0, 14);
+    if (!connected) {
+        display_->print("NOT CONNECTED");
+    } else if (!settings_synced_) {
+        display_->print("SYNCING...");
+    } else if (cmd_pending) {
+        display_->print("SENDING...");
+    } else {
+        display_->print("READY");
+    }
+    display_->setTextColor(1);
+
+    // Big cycle count (y=22)
+    display_->setTextSize(2);
+    char cycle_buf[16];
+    if (!connected) {
+        std::snprintf(cycle_buf, sizeof(cycle_buf), "--");
+    } else {
+        std::snprintf(cycle_buf, sizeof(cycle_buf), "%lu", (unsigned long)current_cycle_);
+    }
+    int16_t x1, y1;
+    uint16_t w, h;
+    display_->getTextBounds(cycle_buf, 0, 0, &x1, &y1, &w, &h);
+    display_->setCursor((128 - w) / 2, 22);
+    display_->print(cycle_buf);
+
+    // Target row (y=40) - only setting we show on this screen
+    display_->setTextSize(1);
+    display_->setCursor(0, 40);
+    display_->print("Target ");
+    display_->print((unsigned long)settings_->fatigue_test.cycle_amount);
+
+    // Footer bar (inverted)
+    display_->fillRect(0, 52, 128, 12, 1);
+    display_->setTextColor(0);
+    display_->setTextSize(1);
+    display_->setCursor(2, 54);
+    display_->print("OK:Actions  BACK:Exit");
+
     display_->display();
 }
 
@@ -292,17 +314,50 @@ void FatigueTester::HandleButton(ButtonId button_id) noexcept
 {
     // Handle popup first
     if (popup_active_) {
+        if (button_id == ButtonId::Back) {
+            popup_active_ = false;
+            popup_mode_ = PopupMode::None;
+            popup_selected_index_ = 0;
+            return;
+        }
+
         if (button_id == ButtonId::Confirm) {
-            if (popup_type_ == 1) { // Start confirmation
-                espnow::SendCommand(GetDeviceId(), 1, nullptr, 0); // Start command
-                current_state_ = device_protocols::FatigueTestState::Running;
-            } else if (popup_type_ == 2) { // Stop confirmation
-                espnow::SendCommand(GetDeviceId(), 4, nullptr, 0); // Stop command
-                current_state_ = device_protocols::FatigueTestState::Idle;
+            // Execute based on popup mode + selection
+            if (popup_mode_ == PopupMode::StartConfirm) {
+                // 0=BACK, 1=START
+                if (popup_selected_index_ == 1) {
+                    espnow::SendCommand(GetDeviceId(), 1, nullptr, 0); // START
+                    pending_command_id_ = 1;
+                    pending_command_tick_ = xTaskGetTickCount();
+                }
+            } else if (popup_mode_ == PopupMode::RunningActions) {
+                // 0=BACK, 1=PAUSE, 2=STOP
+                if (popup_selected_index_ == 1) {
+                    espnow::SendCommand(GetDeviceId(), 2, nullptr, 0); // PAUSE
+                    pending_command_id_ = 2;
+                    pending_command_tick_ = xTaskGetTickCount();
+                } else if (popup_selected_index_ == 2) {
+                    espnow::SendCommand(GetDeviceId(), 4, nullptr, 0); // STOP
+                    pending_command_id_ = 4;
+                    pending_command_tick_ = xTaskGetTickCount();
+                }
+            } else if (popup_mode_ == PopupMode::PausedActions) {
+                // 0=BACK, 1=RESUME, 2=STOP
+                if (popup_selected_index_ == 1) {
+                    espnow::SendCommand(GetDeviceId(), 3, nullptr, 0); // RESUME
+                    pending_command_id_ = 3;
+                    pending_command_tick_ = xTaskGetTickCount();
+                } else if (popup_selected_index_ == 2) {
+                    espnow::SendCommand(GetDeviceId(), 4, nullptr, 0); // STOP
+                    pending_command_id_ = 4;
+                    pending_command_tick_ = xTaskGetTickCount();
+                }
             }
+
             popup_active_ = false;
-        } else if (button_id == ButtonId::Back) {
-            popup_active_ = false;
+            popup_mode_ = PopupMode::None;
+            popup_selected_index_ = 0;
+            return;
         }
         return;
     }
@@ -336,31 +391,32 @@ void FatigueTester::HandleButton(ButtonId button_id) noexcept
     // Handle control screen buttons
     if (current_state_ == device_protocols::FatigueTestState::Idle) {
         if (button_id == ButtonId::Confirm) {
-            // Show start confirmation popup
-            popup_active_ = true;
-            popup_type_ = 1; // Start
+            // If connected, ask user to confirm starting (popup).
+            TickType_t now_ticks = xTaskGetTickCount();
+            bool connected = (last_status_tick_ > 0) && (now_ticks - last_status_tick_ < pdMS_TO_TICKS(5000));
+            if (connected) {
+                popup_active_ = true;
+                popup_mode_ = PopupMode::StartConfirm;
+                popup_selected_index_ = 1; // default to START
+            } else {
+                // Brief visual feedback on the control screen.
+                not_connected_flash_until_tick_ = now_ticks + pdMS_TO_TICKS(1000);
+                RequestStatus();
+            }
         }
     } else if (current_state_ == device_protocols::FatigueTestState::Running) {
         if (button_id == ButtonId::Confirm) {
-            // Pause
-            espnow::SendCommand(GetDeviceId(), 2, nullptr, 0); // Pause command
-            current_state_ = device_protocols::FatigueTestState::Paused;
-        } else if (button_id == ButtonId::Back) {
-            // Show stop confirmation popup
+            // Show action popup: BACK / PAUSE / STOP
             popup_active_ = true;
-            popup_type_ = 2; // Stop
-            popup_yes_selected_ = false; // Default to NO
+            popup_mode_ = PopupMode::RunningActions;
+            popup_selected_index_ = 1; // default to PAUSE
         }
     } else if (current_state_ == device_protocols::FatigueTestState::Paused) {
         if (button_id == ButtonId::Confirm) {
-            // Resume
-            espnow::SendCommand(GetDeviceId(), 3, nullptr, 0); // Resume command
-            current_state_ = device_protocols::FatigueTestState::Running;
-        } else if (button_id == ButtonId::Back) {
-            // Show stop confirmation popup
+            // Show action popup: BACK / RESUME / STOP
             popup_active_ = true;
-            popup_type_ = 2; // Stop
-            popup_yes_selected_ = false; // Default to NO
+            popup_mode_ = PopupMode::PausedActions;
+            popup_selected_index_ = 1; // default to RESUME
         }
     }
 }
@@ -368,8 +424,21 @@ void FatigueTester::HandleButton(ButtonId button_id) noexcept
 void FatigueTester::HandleEncoder(EC11Encoder::Direction direction) noexcept
 {
     if (popup_active_) {
-        // Toggle popup selection
-        popup_yes_selected_ = !popup_yes_selected_;
+        // Navigate popup selection
+        int max_idx = 0;
+        if (popup_mode_ == PopupMode::StartConfirm) {
+            max_idx = 1; // 0..1
+        } else if (popup_mode_ == PopupMode::RunningActions || popup_mode_ == PopupMode::PausedActions) {
+            max_idx = 2; // 0..2
+        }
+
+        if (direction == EC11Encoder::Direction::CW) {
+            if (popup_selected_index_ >= (uint8_t)max_idx) popup_selected_index_ = 0;
+            else popup_selected_index_++;
+        } else if (direction == EC11Encoder::Direction::CCW) {
+            if (popup_selected_index_ == 0) popup_selected_index_ = (uint8_t)max_idx;
+            else popup_selected_index_--;
+        }
         return;
     }
     
@@ -404,18 +473,8 @@ void FatigueTester::HandleEncoderButton(bool pressed) noexcept
     if (!pressed) return;
     
     if (popup_active_) {
-        // Confirm popup selection (encoder button = confirm)
-        if (popup_yes_selected_) {
-            if (popup_type_ == 1) { // Start
-                espnow::SendCommand(GetDeviceId(), 1, nullptr, 0);
-                current_state_ = device_protocols::FatigueTestState::Running;
-            } else if (popup_type_ == 2) { // Stop
-                espnow::SendCommand(GetDeviceId(), 4, nullptr, 0);
-                current_state_ = device_protocols::FatigueTestState::Idle;
-            }
-        }
-        popup_active_ = false;
-        popup_yes_selected_ = false;
+        // Encoder button behaves like CONFIRM in popup
+        HandleButton(ButtonId::Confirm);
         return;
     }
     
@@ -430,6 +489,9 @@ void FatigueTester::HandleEncoderButton(bool pressed) noexcept
         }
         return;
     }
+
+    // Encoder button on control screen behaves like CONFIRM (opens the same popups).
+    HandleButton(ButtonId::Confirm);
 }
 
 void FatigueTester::UpdateFromProtocol(const espnow::ProtoEvent& event) noexcept
@@ -452,13 +514,26 @@ void FatigueTester::UpdateFromProtocol(const espnow::ProtoEvent& event) noexcept
                 settings_->fatigue_test.dwell_time = config.dwell_time_sec;
                 settings_->fatigue_test.bounds_method_stallguard = (config.bounds_method == 0);
                 settings_synced_ = true;
+                last_status_tick_ = xTaskGetTickCount();
+                connected_ = true;
                 SettingsStore::Save(*settings_);
+                pushLogLine("CFG rx");
             }
         }
     } else if (event.type == espnow::MsgType::ConfigAck) {
         settings_synced_ = true;
+        last_status_tick_ = xTaskGetTickCount();
+        connected_ = true;
+        pushLogLine("CFG ack");
+    } else if (event.type == espnow::MsgType::CommandAck) {
+        pending_command_id_ = 0;
+        pending_command_tick_ = 0;
+        last_status_tick_ = xTaskGetTickCount();
+        connected_ = true;
+        pushLogLine("CMD ack");
     } else if (event.type == espnow::MsgType::TestComplete) {
         current_state_ = device_protocols::FatigueTestState::Completed;
+        pushLogLine("DONE");
     } else if (event.type == espnow::MsgType::Error) {
         current_state_ = device_protocols::FatigueTestState::Error;
         if (event.payload_len >= 1) {
@@ -466,10 +541,12 @@ void FatigueTester::UpdateFromProtocol(const espnow::ProtoEvent& event) noexcept
             // Default severity: assume high (3) if not specified
             uint8_t severity = (event.payload_len >= 2) ? event.payload[1] : 3;
             addError(error_code_, severity);
+            pushLogLine("ERR E%u S%u", (unsigned)error_code_, (unsigned)severity);
         }
     } else if (event.type == espnow::MsgType::ErrorClear) {
         // Test unit sent clear error command
         clearErrors();
+        pushLogLine("Errors cleared");
     }
 }
 
@@ -524,11 +601,44 @@ void FatigueTester::renderStatusScreen() noexcept
 
 void FatigueTester::handleStatusUpdate(const device_protocols::FatigueTestStatusPayload& status) noexcept
 {
+    device_protocols::FatigueTestState prev_state = current_state_;
+    uint8_t prev_err = error_code_;
+    uint32_t prev_cycle = current_cycle_;
+
     current_cycle_ = status.cycle_number;
     current_state_ = static_cast<device_protocols::FatigueTestState>(status.state);
     error_code_ = status.err_code;
     last_status_tick_ = xTaskGetTickCount();
     connected_ = true;
+    pending_command_id_ = 0;
+    pending_command_tick_ = 0;
+
+    // Log only meaningful changes (avoid spamming the small log window).
+    if (current_state_ != prev_state) {
+        const char* s = "IDLE";
+        switch (current_state_) {
+            case device_protocols::FatigueTestState::Running: s = "RUN"; break;
+            case device_protocols::FatigueTestState::Paused: s = "PAUSE"; break;
+            case device_protocols::FatigueTestState::Completed: s = "DONE"; break;
+            case device_protocols::FatigueTestState::Error: s = "ERR"; break;
+            default: s = "IDLE"; break;
+        }
+        pushLogLine("State %s", s);
+        last_logged_state_ = current_state_;
+    }
+
+    if (error_code_ != prev_err && error_code_ != 0) {
+        pushLogLine("Err E%u", (unsigned)error_code_);
+        last_logged_error_code_ = error_code_;
+    }
+
+    // Light touch progress logging: every 100 cycles while running.
+    if (current_state_ == device_protocols::FatigueTestState::Running &&
+        current_cycle_ != prev_cycle &&
+        (current_cycle_ % 100U) == 0U) {
+        pushLogLine("Cycle %lu", (unsigned long)current_cycle_);
+        last_logged_cycle_ = current_cycle_;
+    }
 }
 
 void FatigueTester::sendSettingsToDevice() noexcept
@@ -820,33 +930,54 @@ void FatigueTester::RenderPopup() noexcept
     display_->drawLine(10, 18, 118, 18, 1);
     
     // Message
-    const char* msg = (popup_type_ == 1) ? "Start Test?" : "Stop Test?";
+    const char* msg = "";
+    if (popup_mode_ == PopupMode::StartConfirm) msg = "Start Test?";
+    else if (popup_mode_ == PopupMode::RunningActions) msg = "Test Running";
+    else if (popup_mode_ == PopupMode::PausedActions) msg = "Test Paused";
+    else msg = "Action";
     int len = strlen(msg);
     int x = (128 - (len * 6)) / 2;
     if (x < 4) x = 4;
     display_->setCursor(x, 25);
     display_->print(msg);
     
-    // Buttons
-    // NO (Back)
-    if (!popup_yes_selected_) {
-        display_->fillRect(8, 43, 55, 12, 1);
-        display_->setTextColor(0);
+    // Options row
+    display_->setTextSize(1);
+    const int y = 43;
+
+    auto draw_option = [&](int idx, int x, int w, const char* label) {
+        bool selected = (popup_selected_index_ == (uint8_t)idx);
+        if (selected) {
+            display_->fillRect(x, y, w, 12, 1);
+            display_->setTextColor(0);
+        } else {
+            display_->setTextColor(1);
+        }
+        // crude centering: 6px per char
+        int label_len = (int)strlen(label);
+        int tx = x + (w - (label_len * 6)) / 2;
+        if (tx < x + 1) tx = x + 1;
+        display_->setCursor(tx, y + 2);
+        display_->print(label);
+    };
+
+    if (popup_mode_ == PopupMode::StartConfirm) {
+        // BACK / START
+        draw_option(0, 6, 55, "BACK");
+        draw_option(1, 67, 55, "START");
+    } else if (popup_mode_ == PopupMode::RunningActions) {
+        // BACK / PAUSE / STOP
+        draw_option(0, 4, 38, "BACK");
+        draw_option(1, 45, 38, "PAUSE");
+        draw_option(2, 86, 38, "STOP");
+    } else if (popup_mode_ == PopupMode::PausedActions) {
+        // BACK / RESUME / STOP
+        draw_option(0, 4, 38, "BACK");
+        draw_option(1, 45, 38, "RESUME");
+        draw_option(2, 86, 38, "STOP");
     } else {
-        display_->setTextColor(1);
+        draw_option(0, 6, 116, "BACK");
     }
-    display_->setCursor(10, 45);
-    display_->print("NO (Back)");
-    
-    // YES (Ok)
-    if (popup_yes_selected_) {
-        display_->fillRect(68, 43, 55, 12, 1);
-        display_->setTextColor(0);
-    } else {
-        display_->setTextColor(1);
-    }
-    display_->setCursor(70, 45);
-    display_->print("YES (Ok)");
     
     display_->display();
 }

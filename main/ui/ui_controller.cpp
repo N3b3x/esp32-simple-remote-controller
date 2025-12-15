@@ -322,6 +322,39 @@ void UiController::Task(void* arg) noexcept
             handleProtocol(proto_evt);
             renderCurrentScreen();
         }
+
+        // Periodic UI refresh (keeps dynamic/timed UI elements updating even without input events).
+        // This is especially important for the FatigueTester control screen which shows live data
+        // and uses brief visual flashes (e.g., NOT CONNECTED).
+        {
+            static TickType_t last_render_tick = 0;
+            TickType_t now = xTaskGetTickCount();
+            const TickType_t refresh_period = pdMS_TO_TICKS(250);
+            if ((now - last_render_tick) > refresh_period) {
+                if (current_device_ &&
+                    (current_state_ == UiState::DeviceMain || current_state_ == UiState::DeviceControl)) {
+                    renderCurrentScreen();
+                }
+                last_render_tick = now;
+            }
+        }
+
+        // Keepalive / polling: nudge devices so UI stays up-to-date even if the test unit
+        // is not streaming status frequently.
+        {
+            static TickType_t last_poll_tick = 0;
+            TickType_t now = xTaskGetTickCount();
+            const TickType_t poll_period = pdMS_TO_TICKS(1000);
+            if (current_device_ && (now - last_poll_tick) > poll_period) {
+                // Only poll while we're on a device screen.
+                if (current_state_ == UiState::DeviceMain ||
+                    current_state_ == UiState::DeviceControl ||
+                    current_state_ == UiState::DeviceSettings) {
+                    current_device_->RequestStatus();
+                }
+                last_poll_tick = now;
+            }
+        }
         
         // If no events, check if we need to refresh
         // (e.g., for animations or status updates)
@@ -521,11 +554,36 @@ void UiController::handleEncoderButton(bool pressed) noexcept
     last_encoder_button_time = now;
     
     // Encoder button handling for device screens
-    if (current_device_ && 
-        (current_state_ == UiState::DeviceControl || 
+    if (current_device_ &&
+        (current_state_ == UiState::DeviceControl ||
          current_state_ == UiState::DeviceSettings)) {
-        // Device-specific encoder button actions for control and settings screens
+        // Device-specific encoder button actions for control and settings screens.
+        //
+        // IMPORTANT: For the FatigueTester settings menu, selecting the "Back" item is done
+        // via the encoder button. In that case the device will set menu_active_=false, and
+        // we must transition the UI state back to DeviceMain (otherwise the user gets stuck
+        // on the settings screen even though the menu was exited and settings were saved).
+
+        bool menu_was_active = false;
+        if (current_state_ == UiState::DeviceSettings &&
+            current_device_->GetDeviceId() == device_registry::DEVICE_ID_FATIGUE_TESTER_) {
+            FatigueTester* ft = static_cast<FatigueTester*>(current_device_.get());
+            menu_was_active = ft->IsMenuActive();
+        }
+
         current_device_->HandleEncoderButton(pressed);
+
+        if (current_state_ == UiState::DeviceSettings &&
+            menu_was_active &&
+            current_device_->GetDeviceId() == device_registry::DEVICE_ID_FATIGUE_TESTER_) {
+            FatigueTester* ft = static_cast<FatigueTester*>(current_device_.get());
+            if (!ft->IsMenuActive()) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                transitionToState(UiState::DeviceMain);
+                return;
+            }
+        }
+
         renderCurrentScreen();
         return;
     }
@@ -611,6 +669,11 @@ void UiController::renderCurrentScreen() noexcept
 void UiController::transitionToState(UiState new_state) noexcept
 {
     current_state_ = new_state;
+    if (current_device_) {
+        ESP_LOGI(TAG_, "UI state -> %d (device_id=%d)", (int)current_state_, (int)current_device_->GetDeviceId());
+    } else {
+        ESP_LOGI(TAG_, "UI state -> %d", (int)current_state_);
+    }
     renderCurrentScreen();
 }
 

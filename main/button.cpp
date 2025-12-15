@@ -99,12 +99,48 @@ bool Buttons::Init(QueueHandle_t evt_queue) noexcept
 
 void Buttons::ConfigureWakeup() noexcept
 {
-    // BACK and CONFIRM as EXT1 wake sources (any low).
-    // Encoder push (GPIO22) is not RTC-capable on ESP32-C6, so do NOT include it.
-    uint64_t mask = (1ULL << BTN_BACK_GPIO_) |
-                    (1ULL << BTN_CONFIRM_GPIO_);
+    // Configure deep sleep wake sources.
+    //
+    // We use EXT1 wake (ANY_LOW) which requires the pins to be RTC/LP-capable.
+    // On the ESP32-C6, GPIOs 0..7 are LP-capable, so we can use:
+    // - BACK (GPIO6)
+    // - CONFIRM (GPIO4)
+    // - Encoder PSH (GPIO5)  [active LOW]
+    // - Encoder TRA (GPIO7)  [quadrature A, pulled up; rotation produces LOW edges]
+    //
+    // NOTE: Only include RTC/LP-capable pins here; otherwise esp_sleep_enable_ext1_wakeup
+    // may fail or the wake source may not work.
 
-    esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
-    // NOTE: Only RTC-capable pins should be used here to avoid wake errors.
+    const uint64_t mask =
+        (1ULL << BTN_BACK_GPIO_) |
+        (1ULL << BTN_CONFIRM_GPIO_) |
+        (1ULL << ENCODER_PSH_PIN_) |
+        (1ULL << ENCODER_TRA_PIN_);
+
+    // Ensure wake pins are stable-high when idle (ANY_LOW wake).
+    //
+    // IMPORTANT: Do NOT re-run gpio_config() here because it would override the interrupt
+    // configuration done by:
+    // - Buttons::Init() (BACK/CONFIRM are GPIO_INTR_NEGEDGE)
+    // - EC11Encoder::begin() (TRA/TRB/PSH are GPIO_INTR_ANYEDGE)
+    //
+    // Instead, only ensure pull-ups are enabled.
+    (void)gpio_pullup_en(BTN_BACK_GPIO_);
+    (void)gpio_pulldown_dis(BTN_BACK_GPIO_);
+    (void)gpio_pullup_en(BTN_CONFIRM_GPIO_);
+    (void)gpio_pulldown_dis(BTN_CONFIRM_GPIO_);
+    (void)gpio_pullup_en(ENCODER_PSH_PIN_);
+    (void)gpio_pulldown_dis(ENCODER_PSH_PIN_);
+    (void)gpio_pullup_en(ENCODER_TRA_PIN_);
+    (void)gpio_pulldown_dis(ENCODER_TRA_PIN_);
+
+    esp_err_t err = esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_BTN_, "esp_sleep_enable_ext1_wakeup failed: %s (mask=0x%llx)",
+                 esp_err_to_name(err), (unsigned long long)mask);
+    } else {
+        ESP_LOGI(TAG_BTN_, "Deep sleep wake enabled (EXT1 ANY_LOW, mask=0x%llx)",
+                 (unsigned long long)mask);
+    }
 }
 

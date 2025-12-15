@@ -9,6 +9,8 @@
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_mac.h"
+#include "esp_wifi.h"
 
 #include "config.hpp"
 #include "protocol/espnow_protocol.hpp"
@@ -38,6 +40,26 @@ static void power_task(void* arg);
 
 static UiController g_ui_controller;
 
+static void LogMacBanner() noexcept
+{
+    uint8_t mac[6] = {0};
+    esp_err_t err = esp_wifi_get_mac(WIFI_IF_STA, mac);
+    if (err != ESP_OK) {
+        // Fallback: read base STA MAC (works even if WiFi isn't fully up yet)
+        err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    }
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG_MAIN_,
+                 "\n// ==================================================\n"
+                 "// Remote Controller MAC (STA): %02X:%02X:%02X:%02X:%02X:%02X\n"
+                 "// ==================================================",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        ESP_LOGW(TAG_MAIN_, "Failed to read MAC address: %s", esp_err_to_name(err));
+    }
+}
+
 extern "C" void app_main(void)
 {
     g_boot_tick_ = xTaskGetTickCount();
@@ -53,6 +75,7 @@ extern "C" void app_main(void)
 
     // Init ESPNOW
     espnow::Init(g_proto_queue_);
+    LogMacBanner();
 
     // Buttons (ISR->g_button_queue_)
     Buttons::Init(g_button_queue_);
