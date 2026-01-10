@@ -40,9 +40,9 @@ EC11Encoder::EC11Encoder(gpio_num_t tra_pin, gpio_num_t trb_pin, gpio_num_t psh_
     : tra_pin_(tra_pin), trb_pin_(trb_pin), psh_pin_(psh_pin),
       pulses_per_rev_(pulses_per_rev), position_(0), min_pos_(INT32_MIN),
       max_pos_(INT32_MAX), button_state_(false), button_press_count_(0),
-      last_direction_(Direction::NONE), event_queue_(nullptr), last_state_(0),
-      last_rotation_time_(0), last_button_time_(0),
-      rotation_debounce_ms_(1), button_debounce_ms_(50), task_handle_(nullptr) {
+      last_direction_(Direction::NONE), event_queue_(nullptr), isr_queue_(nullptr),
+      last_state_(0), detent_counter_(0), last_rotation_time_(0), last_button_time_(0),
+      rotation_debounce_ms_(5), button_debounce_ms_(50), task_handle_(nullptr) {
 }
 
 EC11Encoder::~EC11Encoder() {
@@ -53,10 +53,19 @@ bool EC11Encoder::begin(int32_t min_pos, int32_t max_pos) {
     min_pos_ = min_pos;
     max_pos_ = max_pos;
     
-    // Create event queue
+    // Create event queue for user consumption
     event_queue_ = xQueueCreate(10, sizeof(Event));
     if (!event_queue_) {
         ESP_LOGE(TAG_EC11, "Failed to create event queue");
+        return false;
+    }
+    
+    // Create ISR queue for internal ISR->task communication
+    isr_queue_ = xQueueCreate(20, sizeof(IsrEvent));
+    if (!isr_queue_) {
+        ESP_LOGE(TAG_EC11, "Failed to create ISR queue");
+        vQueueDelete(event_queue_);
+        event_queue_ = nullptr;
         return false;
     }
     
@@ -152,6 +161,11 @@ void EC11Encoder::end() {
         event_queue_ = nullptr;
     }
     
+    if (isr_queue_) {
+        vQueueDelete(isr_queue_);
+        isr_queue_ = nullptr;
+    }
+    
     gpio_isr_handler_remove(tra_pin_);
     gpio_isr_handler_remove(trb_pin_);
     gpio_isr_handler_remove(psh_pin_);
@@ -159,6 +173,7 @@ void EC11Encoder::end() {
 
 void EC11Encoder::setPosition(int32_t pos) {
     position_ = clampPosition(pos);
+    detent_counter_ = 0;  // Reset partial detent accumulation
 }
 
 int32_t EC11Encoder::clampPosition(int32_t pos) const {
@@ -169,59 +184,65 @@ int32_t EC11Encoder::clampPosition(int32_t pos) const {
 
 void IRAM_ATTR EC11Encoder::gpio_isr_handler(void* arg) {
     EC11Encoder* encoder = static_cast<EC11Encoder*>(arg);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     
-    // Read current state
+    // Read current encoder state
     uint8_t tra_state = gpio_get_level(encoder->tra_pin_);
     uint8_t trb_state = gpio_get_level(encoder->trb_pin_);
     uint8_t new_state = (tra_state << 1) | trb_state;
     
-    // Check if state changed
-    if (new_state != encoder->last_state_) {
-        // Notify task (non-blocking)
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xTaskNotifyFromISR(encoder->task_handle_, 1, eSetBits, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    // Capture rotation state transition atomically
+    uint8_t old_state = encoder->last_state_;
+    if (new_state != old_state) {
+        // Update last_state_ immediately to prevent duplicate detection
+        encoder->last_state_ = new_state;
+        
+        // Send the state transition to the task for processing
+        IsrEvent evt = {
+            .old_state = old_state,
+            .new_state = new_state,
+            .is_button = false,
+            .button_pressed = false
+        };
+        xQueueSendFromISR(encoder->isr_queue_, &evt, &xHigherPriorityTaskWoken);
     }
     
-    // Check button
+    // Check button state change
     bool button_pressed = (gpio_get_level(encoder->psh_pin_) == 0);
     if (button_pressed != encoder->button_state_) {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xTaskNotifyFromISR(encoder->task_handle_, 2, eSetBits, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        IsrEvent evt = {
+            .old_state = 0,
+            .new_state = 0,
+            .is_button = true,
+            .button_pressed = button_pressed
+        };
+        xQueueSendFromISR(encoder->isr_queue_, &evt, &xHigherPriorityTaskWoken);
     }
+    
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void EC11Encoder::encoder_task(void* arg) {
     EC11Encoder* encoder = static_cast<EC11Encoder*>(arg);
-    uint32_t notification_value;
+    IsrEvent isr_evt;
     
     while (1) {
-        // Wait for notification from ISR
-        if (xTaskNotifyWait(0, ULONG_MAX, &notification_value, portMAX_DELAY)) {
+        // Wait for events from ISR queue
+        if (xQueueReceive(encoder->isr_queue_, &isr_evt, portMAX_DELAY) == pdTRUE) {
             int64_t now = esp_timer_get_time() / 1000; // Convert to milliseconds
             
-            // Process rotation
-            if (notification_value & 1) {
-                uint8_t tra_state = gpio_get_level(encoder->tra_pin_);
-                uint8_t trb_state = gpio_get_level(encoder->trb_pin_);
-                uint8_t new_state = (tra_state << 1) | trb_state;
-                
-                // Debounce check
-                if ((now - encoder->last_rotation_time_) >= encoder->rotation_debounce_ms_) {
-                    encoder->processQuadratureChange(new_state);
-                    encoder->last_rotation_time_ = now;
-                }
-            }
-            
-            // Process button
-            if (notification_value & 2) {
-                bool button_pressed = (gpio_get_level(encoder->psh_pin_) == 0);
-                
-                // Debounce check
+            if (isr_evt.is_button) {
+                // Process button event with debouncing
                 if ((now - encoder->last_button_time_) >= encoder->button_debounce_ms_) {
-                    encoder->processButtonChange(button_pressed);
+                    encoder->processButtonChange(isr_evt.button_pressed);
                     encoder->last_button_time_ = now;
+                }
+            } else {
+                // Process rotation event with debouncing
+                // Use the captured state transition from ISR (not re-read GPIO)
+                if ((now - encoder->last_rotation_time_) >= encoder->rotation_debounce_ms_) {
+                    encoder->processQuadratureChangeFromStates(isr_evt.old_state, isr_evt.new_state);
+                    encoder->last_rotation_time_ = now;
                 }
             }
         }
@@ -229,8 +250,13 @@ void EC11Encoder::encoder_task(void* arg) {
 }
 
 void EC11Encoder::processQuadratureChange(uint8_t new_state) {
+    // Legacy function - redirect to new implementation
+    processQuadratureChangeFromStates(last_state_, new_state);
+}
+
+void EC11Encoder::processQuadratureChangeFromStates(uint8_t old_state, uint8_t new_state) {
     // Build lookup index: [old_A old_B new_A new_B]
-    uint8_t lookup_index = (last_state_ << 2) | new_state;
+    uint8_t lookup_index = (old_state << 2) | new_state;
     
     if (lookup_index >= 16) {
         return; // Invalid state
@@ -239,33 +265,48 @@ void EC11Encoder::processQuadratureChange(uint8_t new_state) {
     int8_t direction = QUADRATURE_TABLE[lookup_index];
     
     if (direction != 0) {
-        // Update position
-        int32_t old_pos = position_;
+        // Accumulate transitions: EC11 encoders have 4 state transitions per detent
+        // We only want to emit one event per detent (physical click)
+        detent_counter_ += direction;
         
-        if (direction > 0) {
+        // Check if we've accumulated a full detent (4 transitions in same direction)
+        // Using threshold of 4 for full detent, but also handle direction changes
+        const int8_t TRANSITIONS_PER_DETENT = 4;
+        
+        if (detent_counter_ >= TRANSITIONS_PER_DETENT) {
+            // Full CW detent
+            detent_counter_ -= TRANSITIONS_PER_DETENT;
             position_++;
             last_direction_ = Direction::CW;
-        } else {
-            position_--;
-            last_direction_ = Direction::CCW;
-        }
-        
-        position_ = clampPosition(position_);
-        
-        // Send event if position changed
-        if (position_ != old_pos) {
+            position_ = clampPosition(position_);
+            
             Event evt = {
                 .type = EventType::ROTATION,
-                .direction = last_direction_,
+                .direction = Direction::CW,
                 .position = position_,
                 .button_pressed = false
             };
+            xQueueSend(event_queue_, &evt, 0);
             
-            xQueueSend(event_queue_, &evt, 0); // Non-blocking
+        } else if (detent_counter_ <= -TRANSITIONS_PER_DETENT) {
+            // Full CCW detent
+            detent_counter_ += TRANSITIONS_PER_DETENT;
+            position_--;
+            last_direction_ = Direction::CCW;
+            position_ = clampPosition(position_);
+            
+            Event evt = {
+                .type = EventType::ROTATION,
+                .direction = Direction::CCW,
+                .position = position_,
+                .button_pressed = false
+            };
+            xQueueSend(event_queue_, &evt, 0);
         }
+        // If counter hasn't reached threshold, wait for more transitions
     }
     
-    last_state_ = new_state;
+    // Note: last_state_ is already updated by ISR, no need to update here
 }
 
 void EC11Encoder::processButtonChange(bool pressed) {

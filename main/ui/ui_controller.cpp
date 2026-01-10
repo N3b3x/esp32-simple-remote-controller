@@ -94,6 +94,8 @@ bool UiController::Init(QueueHandle_t ui_queue, Settings* settings,
     last_activity_tick_ = inactivity_ticks_ptr;
     selected_device_id_ = 0;
     popup_active_ = false;
+    last_encoder_button_state_ = false;
+    last_encoder_pos_ = 0;
     
     // Initialize display first (needed for device creation)
     Adafruit_I2CDevice::setDefaultPins(OLED_SDA_PIN_, OLED_SCL_PIN_);
@@ -227,11 +229,6 @@ void UiController::Task(void* arg) noexcept
     ButtonEvent button_evt{};
     espnow::ProtoEvent proto_evt{};
     
-    // Poll encoder button and rotation
-    bool last_encoder_button_state = false;
-    int32_t last_encoder_pos = 0;
-    bool encoder_pos_initialized = false;
-    
     // Initialize encoder position tracking based on current selection
     if (s_encoder_ && current_state_ == UiState::DeviceSelection) {
         const auto& device_ids = device_registry::GetAvailableDeviceIds();
@@ -244,72 +241,14 @@ void UiController::Task(void* arg) noexcept
                     break;
                 }
             }
-            // Set encoder position to match selection (multiply by 4 for granularity)
-            s_encoder_->setPosition(static_cast<int32_t>(current_idx) * 4);
-            last_encoder_pos = current_idx;
-            encoder_pos_initialized = true;
+            // Set encoder position to match selection index
+            resetEncoderTracking(static_cast<int32_t>(current_idx));
         }
-    }
-    
-    if (s_encoder_ && !encoder_pos_initialized) {
-        last_encoder_pos = s_encoder_->getPosition() / 4;
     }
     
     while (true) {
-        // Check encoder button
-        if (s_encoder_) {
-            bool current_encoder_button = s_encoder_->isButtonPressed();
-            if (current_encoder_button && !last_encoder_button_state) {
-                handleEncoderButton(true);
-                renderCurrentScreen();
-            }
-            last_encoder_button_state = current_encoder_button;
-            
-            // Check encoder rotation
-            int32_t current_pos = s_encoder_->getPosition() / 4;
-            if (current_pos != last_encoder_pos) {
-                if (current_state_ == UiState::DeviceSelection) {
-                    // Device selection navigation
-                    const auto& device_ids = device_registry::GetAvailableDeviceIds();
-                    if (!device_ids.empty()) {
-                        // Find current selection index
-                        size_t current_idx = 0;
-                        for (size_t i = 0; i < device_ids.size(); ++i) {
-                            if (device_ids[i] == selected_device_id_) {
-                                current_idx = i;
-                                break;
-                            }
-                        }
-                        
-                        // Navigate based on rotation (normal: CW moves down, CCW moves up)
-                        // Normal: CW (position increases) moves down, CCW (position decreases) moves up
-                        if (current_pos > last_encoder_pos && current_idx < device_ids.size() - 1) {
-                            // Encoder rotated CW (position increased), move to next item (down)
-                            selected_device_id_ = device_ids[current_idx + 1];
-                            renderCurrentScreen();
-                        } else if (current_pos < last_encoder_pos && current_idx > 0) {
-                            // Encoder rotated CCW (position decreased), move to previous item (up)
-                            selected_device_id_ = device_ids[current_idx - 1];
-                            renderCurrentScreen();
-                        }
-                    }
-                } else if (current_device_ && 
-                          (current_state_ == UiState::DeviceMain || 
-                           current_state_ == UiState::DeviceSettings || 
-                           current_state_ == UiState::DeviceControl)) {
-                    // Device screen encoder handling (for menu navigation)
-                    // Normal direction: CW (position increases) = CW direction, CCW (position decreases) = CCW direction
-                    EC11Encoder::Direction dir = (current_pos > last_encoder_pos) ? 
-                                                  EC11Encoder::Direction::CW : 
-                                                  EC11Encoder::Direction::CCW;
-                    current_device_->HandleEncoder(dir);
-                    renderCurrentScreen();
-                }
-                
-                // Menu rendering is handled in settings screen
-                last_encoder_pos = current_pos;
-            }
-        }
+        // Process encoder events (event-based handling for reliable navigation)
+        processEncoderEvents();
         
         // Check for button events from UI queue (forwarded by button_task)
         if (xQueueReceive(ui_queue_, &button_evt, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -427,9 +366,7 @@ void UiController::handleButton(const ButtonEvent& event) noexcept
                     if (current_device_) {
                         transitionToState(UiState::DeviceMain);
                         // Reset encoder position when entering device screen
-                        if (s_encoder_) {
-                            s_encoder_->setPosition(0);
-                        }
+                        resetEncoderTracking(0);
                     }
                 }
             }
@@ -616,9 +553,7 @@ void UiController::handleEncoderButton(bool pressed) noexcept
                     if (current_device_) {
                         transitionToState(UiState::DeviceMain);
                         // Reset encoder position when entering device screen
-                        if (s_encoder_) {
-                            s_encoder_->setPosition(0);
-                        }
+                        resetEncoderTracking(0);
                     }
                 }
             }
@@ -862,5 +797,89 @@ void UiController::renderDeviceControlScreen() noexcept
 void UiController::renderPopup() noexcept
 {
     // TODO: Implement popup rendering
+}
+
+void UiController::resetEncoderTracking(int32_t position) noexcept
+{
+    if (s_encoder_) {
+        s_encoder_->setPosition(position);
+        last_encoder_pos_ = position;
+        
+        // Drain any pending encoder events to prevent stale events from causing issues
+        EC11Encoder::Event evt;
+        while (s_encoder_->getEventQueue() && 
+               xQueueReceive(s_encoder_->getEventQueue(), &evt, 0) == pdTRUE) {
+            // Discard pending events
+        }
+    }
+}
+
+void UiController::processEncoderEvents() noexcept
+{
+    if (!s_encoder_) return;
+    
+    // Check encoder button state (direct polling for button is fine)
+    bool current_encoder_button = s_encoder_->isButtonPressed();
+    if (current_encoder_button && !last_encoder_button_state_) {
+        handleEncoderButton(true);
+        renderCurrentScreen();
+    }
+    last_encoder_button_state_ = current_encoder_button;
+    
+    // Process encoder rotation events from the event queue
+    // This gives us reliable, event-based handling without division artifacts
+    EC11Encoder::Event evt;
+    bool had_rotation = false;
+    
+    while (s_encoder_->getEventQueue() && 
+           xQueueReceive(s_encoder_->getEventQueue(), &evt, 0) == pdTRUE) {
+        
+        if (evt.type == EC11Encoder::EventType::ROTATION) {
+            had_rotation = true;
+            
+            if (current_state_ == UiState::DeviceSelection) {
+                // Device selection navigation
+                const auto& device_ids = device_registry::GetAvailableDeviceIds();
+                if (!device_ids.empty()) {
+                    // Find current selection index
+                    size_t current_idx = 0;
+                    for (size_t i = 0; i < device_ids.size(); ++i) {
+                        if (device_ids[i] == selected_device_id_) {
+                            current_idx = i;
+                            break;
+                        }
+                    }
+                    
+                    // Navigate based on rotation direction
+                    if (evt.direction == EC11Encoder::Direction::CW && 
+                        current_idx < device_ids.size() - 1) {
+                        // CW moves down (next item)
+                        selected_device_id_ = device_ids[current_idx + 1];
+                    } else if (evt.direction == EC11Encoder::Direction::CCW && 
+                               current_idx > 0) {
+                        // CCW moves up (previous item)
+                        selected_device_id_ = device_ids[current_idx - 1];
+                    }
+                }
+            } else if (current_device_ && 
+                      (current_state_ == UiState::DeviceMain || 
+                       current_state_ == UiState::DeviceSettings || 
+                       current_state_ == UiState::DeviceControl)) {
+                // Device screen encoder handling (for menu navigation)
+                current_device_->HandleEncoder(evt.direction);
+            }
+            
+            // Update tracking position
+            last_encoder_pos_ = evt.position;
+        } else if (evt.type == EC11Encoder::EventType::BUTTON && evt.button_pressed) {
+            // Button press event from queue (alternative to polling)
+            handleEncoderButton(true);
+        }
+    }
+    
+    // Render if we processed any rotation events
+    if (had_rotation) {
+        renderCurrentScreen();
+    }
 }
 

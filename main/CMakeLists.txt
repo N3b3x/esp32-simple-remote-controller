@@ -61,6 +61,7 @@ set(MAIN_REQUIRES
     esp_wifi
     esp_netif
     esp_event
+    mbedtls               # For HMAC-SHA256 pairing security
     Adafruit_GFX          # Adafruit GFX graphics library
     Adafruit_BusIO_ESPIDF # Adafruit BusIO ESP-IDF native implementation (I2C + SPI)
     Adafruit_SH1106_ESPIDF # SH1106 OLED driver
@@ -84,6 +85,7 @@ if(APP_TYPE STREQUAL "remote_controller")
         "button.cpp"
         "settings.cpp"
         "protocol/espnow_protocol.cpp"
+        "protocol/espnow_peer_store.cpp"
         "devices/device_base.cpp"
         "devices/device_registry.cpp"
         "devices/fatigue_tester.cpp"
@@ -134,4 +136,21 @@ endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     "EXAMPLE_TYPE_${APP_TYPE}=1"
 )
+
+# =============================================================================
+# ESP-NOW Pairing Secret Injection
+# =============================================================================
+# The secret is passed from build_app.sh via -D ESPNOW_PAIRING_SECRET_HEX
+# If not provided:
+#   - Debug builds: Use placeholder (with warning)
+#   - Release builds: Compile error with helpful message
+# =============================================================================
+if(DEFINED ESPNOW_PAIRING_SECRET_HEX)
+    message(STATUS "ESP-NOW pairing secret: configured")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        ESPNOW_PAIRING_SECRET_HEX="${ESPNOW_PAIRING_SECRET_HEX}"
+    )
+else()
+    message(STATUS "ESP-NOW pairing secret: not configured (using build-type defaults)")
+endif()
 

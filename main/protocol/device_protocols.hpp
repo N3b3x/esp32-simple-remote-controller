@@ -3,6 +3,7 @@
  * @brief Device-specific protocol definitions
  * 
  * Contains payload structures for different device types.
+ * These structures must match the corresponding definitions in each device's firmware.
  */
 
 #pragma once
@@ -13,25 +14,56 @@
 // Device-specific payload structures
 namespace device_protocols {
 
-// Fatigue test device payloads
+// ============================================================================
+// Fatigue Test Device Payloads
+// ============================================================================
+
+/**
+ * @brief Configuration payload for fatigue test device.
+ * 
+ * @details
+ * This structure is sent in CONFIG_SET messages and received in CONFIG_RESPONSE.
+ * Extended fields (float parameters) are optional - older firmware versions
+ * may not support them. When sending, always send the full structure.
+ * When receiving, check the payload length to determine if extended fields
+ * are present.
+ */
 #pragma pack(push, 1)
 struct FatigueTestConfigPayload {
-    uint32_t cycle_amount;
-    uint32_t time_per_cycle_sec;
-    uint32_t dwell_time_sec;
-    uint8_t  bounds_method;      // 0 = stallguard, 1 = encoder
+    // Base fields (13 bytes) - required, always present
+    uint32_t cycle_amount;          ///< Target number of test cycles
+    uint32_t time_per_cycle_sec;    ///< Time per cycle in seconds
+    uint32_t dwell_time_sec;        ///< Dwell time at endpoints in seconds
+    uint8_t  bounds_method;         ///< 0 = StallGuard, 1 = Encoder
+    
+    // Extended fields (16 bytes) - optional, for advanced configuration
+    float    bounds_search_velocity_rpm;       ///< Search speed during bounds finding (RPM)
+    float    stallguard_min_velocity_rpm;      ///< Minimum velocity threshold for StallGuard2 (RPM)
+    float    stall_detection_current_factor;   ///< Current reduction factor (0.0-1.0)
+    float    bounds_search_accel_rev_s2;       ///< Acceleration during bounds finding (rev/s²)
 };
 
+/**
+ * @brief Status update payload for fatigue test device.
+ */
 struct FatigueTestStatusPayload {
-    uint32_t cycle_number;
-    uint8_t  state;      // TestState enum
-    uint8_t  err_code;   // if state == ERROR
+    uint32_t cycle_number;  ///< Current cycle count
+    uint8_t  state;         ///< FatigueTestState enum value
+    uint8_t  err_code;      ///< Error code if state == Error
 };
 
+/**
+ * @brief Command payload for fatigue test device.
+ */
 struct FatigueTestCommandPayload {
-    uint8_t command_id;  // 1=START, 2=PAUSE, 3=RESUME, 4=STOP
+    uint8_t command_id;  ///< 1=Start, 2=Pause, 3=Resume, 4=Stop
 };
 
+/**
+ * @brief Test state enumeration for fatigue test device.
+ * 
+ * Per coding standards: PascalCase for enum values (state types).
+ */
 enum class FatigueTestState : uint8_t {
     Idle = 0,
     Running,
@@ -39,9 +71,28 @@ enum class FatigueTestState : uint8_t {
     Completed,
     Error
 };
+
+/**
+ * @brief Command ID enumeration for fatigue test device.
+ * 
+ * Per coding standards: PascalCase for enum values.
+ */
+enum class FatigueTestCommandId : uint8_t {
+    Start = 1,
+    Pause = 2,
+    Resume = 3,
+    Stop = 4
+};
 #pragma pack(pop)
 
-// Mock device payloads (for demonstration)
+// Size constants for payload validation
+static constexpr size_t FATIGUE_TEST_CONFIG_BASE_SIZE = 13;     ///< Base config payload size (without extended fields)
+static constexpr size_t FATIGUE_TEST_CONFIG_FULL_SIZE = sizeof(FatigueTestConfigPayload);  ///< Full config payload size
+
+// ============================================================================
+// Mock Device Payloads (for demonstration/testing)
+// ============================================================================
+
 #pragma pack(push, 1)
 struct MockDeviceConfigPayload {
     uint32_t param1;
@@ -58,4 +109,3 @@ struct MockDeviceStatusPayload {
 #pragma pack(pop)
 
 } // namespace device_protocols
-

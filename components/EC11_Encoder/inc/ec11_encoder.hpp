@@ -52,6 +52,16 @@ public:
     };
     
     /**
+     * @brief Internal ISR event structure for ISR->task communication
+     */
+    struct IsrEvent {
+        uint8_t old_state;     // State before transition
+        uint8_t new_state;     // State after transition
+        bool is_button;        // true if button event, false if rotation
+        bool button_pressed;   // Button state (valid only if is_button)
+    };
+    
+    /**
      * @brief Constructor
      * @param tra_pin Phase A (CLK) GPIO pin
      * @param trb_pin Phase B (DT) GPIO pin
@@ -158,10 +168,12 @@ private:
     
     Direction last_direction_;     // Last rotation direction
     
-    QueueHandle_t event_queue_;    // Event queue
+    QueueHandle_t event_queue_;    // Event queue for user consumption
+    QueueHandle_t isr_queue_;      // Internal queue for ISR->task communication
     
     // Quadrature state
-    uint8_t last_state_;          // Last quadrature state
+    volatile uint8_t last_state_;  // Last quadrature state (volatile for ISR access)
+    int8_t detent_counter_;        // Accumulates transitions until a full detent (4 transitions)
     int64_t last_rotation_time_; // Last rotation timestamp (for debouncing)
     int64_t last_button_time_;    // Last button change timestamp (for debouncing)
     
@@ -177,8 +189,11 @@ private:
     // Quadrature decoding table (Gray code)
     static const int8_t QUADRATURE_TABLE[16];
     
-    // Process quadrature change
+    // Process quadrature change (legacy - uses last_state_)
     void processQuadratureChange(uint8_t new_state);
+    
+    // Process quadrature change from captured state transition
+    void processQuadratureChangeFromStates(uint8_t old_state, uint8_t new_state);
     
     // Process button change
     void processButtonChange(bool pressed);

@@ -1,6 +1,19 @@
 /**
  * @file fatigue_tester.cpp
  * @brief Fatigue test device implementation with full menu and screen support
+ * 
+ * Menu structure (11 items):
+ *   0: Cycles          (uint32, step 100)
+ *   1: Time/Cycle      (uint32, step 1)
+ *   2: Dwell Time      (uint32, step 1)
+ *   3: Bounds Mode     (choice: StallGuard/Encoder)
+ *   4: Search Speed    (float RPM, step 5.0)
+ *   5: SG Min Vel      (float RPM, step 1.0)
+ *   6: Current Factor  (float 0.0-1.0, step 0.05)
+ *   7: Search Accel    (float rev/s², step 0.5)
+ *   8: Error Severity  (uint8 1-3, step 1)
+ *   9: Flip Screen     (choice: Normal/Flipped)
+ *  10: Back            (saves and exits)
  */
 
 #include "fatigue_tester.hpp"
@@ -34,8 +47,10 @@ FatigueTester::FatigueTester(Adafruit_SH1106* display, Settings* settings) noexc
     , menu_active_(false)
     , menu_selected_index_(0)
     , editing_value_(false)
+    , editing_float_(false)
     , editing_choice_(false)
     , menu_edit_step_(1)
+    , menu_edit_step_float_(1.0f)
     , error_count_(0)
     , confirm_hold_start_(0)
     , confirm_held_(false)
@@ -365,8 +380,9 @@ void FatigueTester::HandleButton(ButtonId button_id) noexcept
     // Handle menu navigation
     if (menu_active_) {
         if (button_id == ButtonId::Back) {
-            if (editing_value_ || editing_choice_) {
+            if (editing_value_ || editing_float_ || editing_choice_) {
                 editing_value_ = false;
+                editing_float_ = false;
                 editing_choice_ = false;
             } else {
                 menu_active_ = false;
@@ -377,8 +393,9 @@ void FatigueTester::HandleButton(ButtonId button_id) noexcept
                 }
             }
         } else if (button_id == ButtonId::Confirm) {
-            if (editing_value_ || editing_choice_) {
+            if (editing_value_ || editing_float_ || editing_choice_) {
                 editing_value_ = false;
+                editing_float_ = false;
                 editing_choice_ = false;
             } else {
                 // Enter edit mode or execute action
@@ -444,11 +461,18 @@ void FatigueTester::HandleEncoder(EC11Encoder::Direction direction) noexcept
     
     if (menu_active_) {
         if (editing_value_) {
-            // Adjust value
+            // Adjust integer value
             if (direction == EC11Encoder::Direction::CW) {
                 adjustCurrentValue(menu_edit_step_);
             } else {
                 adjustCurrentValue(-static_cast<int32_t>(menu_edit_step_));
+            }
+        } else if (editing_float_) {
+            // Adjust float value
+            if (direction == EC11Encoder::Direction::CW) {
+                adjustCurrentFloatValue(1);
+            } else {
+                adjustCurrentFloatValue(-1);
             }
         } else if (editing_choice_) {
             // Toggle choice
@@ -458,7 +482,7 @@ void FatigueTester::HandleEncoder(EC11Encoder::Direction direction) noexcept
             if (direction == EC11Encoder::Direction::CW) {
                 // CW moves down (increase index)
                 menu_selected_index_++;
-                if (menu_selected_index_ >= 7) menu_selected_index_ = 6;
+                if (menu_selected_index_ >= MENU_ITEM_COUNT) menu_selected_index_ = MENU_ITEM_COUNT - 1;
             } else {
                 // CCW moves up (decrease index)
                 if (menu_selected_index_ > 0) menu_selected_index_--;
@@ -479,9 +503,10 @@ void FatigueTester::HandleEncoderButton(bool pressed) noexcept
     }
     
     if (menu_active_) {
-        if (editing_value_ || editing_choice_) {
+        if (editing_value_ || editing_float_ || editing_choice_) {
             // Save and exit edit mode
             editing_value_ = false;
+            editing_float_ = false;
             editing_choice_ = false;
         } else {
             // Enter edit mode
@@ -504,15 +529,43 @@ void FatigueTester::UpdateFromProtocol(const espnow::ProtoEvent& event) noexcept
         std::memcpy(&status, event.payload, sizeof(status));
         handleStatusUpdate(status);
     } else if (event.type == espnow::MsgType::ConfigResponse) {
-        // Settings received from device
-        if (event.payload_len >= sizeof(device_protocols::FatigueTestConfigPayload)) {
+        // Settings received from device - handle both base and extended fields
+        // Minimum payload = base fields (13 bytes)
+        constexpr size_t BASE_CONFIG_SIZE = 13; // 4+4+4+1 = cycle_amount, time_per_cycle, dwell_time, bounds_method
+        
+        if (event.payload_len >= BASE_CONFIG_SIZE) {
             device_protocols::FatigueTestConfigPayload config{};
-            std::memcpy(&config, event.payload, sizeof(config));
-            if (settings_) {
+            // Copy only the received bytes to handle older firmware without extended fields
+            size_t copy_len = (event.payload_len < sizeof(config)) ? event.payload_len : sizeof(config);
+            std::memcpy(&config, event.payload, copy_len);
+            
+            // DON'T overwrite settings while user is editing in the menu
+            // Only update connection status and sync flag
+            if (menu_active_) {
+                last_status_tick_ = xTaskGetTickCount();
+                connected_ = true;
+                pushLogLine("CFG rx (menu)");
+                // Don't update settings_ or save - user is editing
+            } else if (settings_) {
+                // Base fields (always present)
                 settings_->fatigue_test.cycle_amount = config.cycle_amount;
                 settings_->fatigue_test.time_per_cycle = config.time_per_cycle_sec;
                 settings_->fatigue_test.dwell_time = config.dwell_time_sec;
                 settings_->fatigue_test.bounds_method_stallguard = (config.bounds_method == 0);
+                
+                // Extended fields (present in newer firmware with full payload)
+                if (event.payload_len >= sizeof(device_protocols::FatigueTestConfigPayload)) {
+                    settings_->fatigue_test.bounds_search_velocity_rpm = config.bounds_search_velocity_rpm;
+                    settings_->fatigue_test.stallguard_min_velocity_rpm = config.stallguard_min_velocity_rpm;
+                    settings_->fatigue_test.stall_detection_current_factor = config.stall_detection_current_factor;
+                    settings_->fatigue_test.bounds_search_accel_rev_s2 = config.bounds_search_accel_rev_s2;
+                    ESP_LOGI(TAG_, "Config received with extended fields: search_vel=%.1f, sg_min=%.1f, cur_factor=%.2f, accel=%.1f",
+                             config.bounds_search_velocity_rpm, config.stallguard_min_velocity_rpm,
+                             config.stall_detection_current_factor, config.bounds_search_accel_rev_s2);
+                } else {
+                    ESP_LOGI(TAG_, "Config received (base fields only, payload_len=%u)", event.payload_len);
+                }
+                
                 settings_synced_ = true;
                 last_status_tick_ = xTaskGetTickCount();
                 connected_ = true;
@@ -645,11 +698,26 @@ void FatigueTester::sendSettingsToDevice() noexcept
 {
     if (!settings_) return;
     
+    // Build config payload with all fields including extended ones
     device_protocols::FatigueTestConfigPayload config{};
+    
+    // Base fields
     config.cycle_amount = settings_->fatigue_test.cycle_amount;
     config.time_per_cycle_sec = settings_->fatigue_test.time_per_cycle;
     config.dwell_time_sec = settings_->fatigue_test.dwell_time;
     config.bounds_method = settings_->fatigue_test.bounds_method_stallguard ? 0 : 1;
+    
+    // Extended fields (0.0f means "use test unit defaults")
+    config.bounds_search_velocity_rpm = settings_->fatigue_test.bounds_search_velocity_rpm;
+    config.stallguard_min_velocity_rpm = settings_->fatigue_test.stallguard_min_velocity_rpm;
+    config.stall_detection_current_factor = settings_->fatigue_test.stall_detection_current_factor;
+    config.bounds_search_accel_rev_s2 = settings_->fatigue_test.bounds_search_accel_rev_s2;
+    
+    ESP_LOGI(TAG_, "Sending config: cycles=%lu, time=%lu, dwell=%lu, bounds=%s, search_vel=%.1f, sg_min=%.1f, cur_factor=%.2f, accel=%.1f",
+             (unsigned long)config.cycle_amount, (unsigned long)config.time_per_cycle_sec,
+             (unsigned long)config.dwell_time_sec, config.bounds_method == 0 ? "SG" : "ENC",
+             config.bounds_search_velocity_rpm, config.stallguard_min_velocity_rpm,
+             config.stall_detection_current_factor, config.bounds_search_accel_rev_s2);
     
     espnow::SendConfigSet(GetDeviceId(), &config, sizeof(config));
     settings_synced_ = false;
@@ -660,28 +728,28 @@ void FatigueTester::adjustCurrentValue(int32_t delta) noexcept
     if (!settings_) return;
     
     switch (menu_selected_index_) {
-        case 0: { // Cycles
+        case MENU_CYCLES: {
             int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.cycle_amount) + delta;
             if (new_val < 1) new_val = 1;
             if (new_val > 100000) new_val = 100000;
             settings_->fatigue_test.cycle_amount = static_cast<uint32_t>(new_val);
             break;
         }
-        case 1: { // Time per cycle
+        case MENU_TIME_PER_CYCLE: {
             int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.time_per_cycle) + delta;
             if (new_val < 1) new_val = 1;
             if (new_val > 3600) new_val = 3600;
             settings_->fatigue_test.time_per_cycle = static_cast<uint32_t>(new_val);
             break;
         }
-        case 2: { // Dwell time
+        case MENU_DWELL_TIME: {
             int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.dwell_time) + delta;
             if (new_val < 0) new_val = 0;
             if (new_val > 60) new_val = 60;
             settings_->fatigue_test.dwell_time = static_cast<uint32_t>(new_val);
             break;
         }
-        case 4: { // Error severity
+        case MENU_ERROR_SEVERITY: {
             int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.error_severity_min) + delta;
             if (new_val < 1) new_val = 1;
             if (new_val > 3) new_val = 3;
@@ -691,13 +759,56 @@ void FatigueTester::adjustCurrentValue(int32_t delta) noexcept
     }
 }
 
+void FatigueTester::adjustCurrentFloatValue(int32_t delta) noexcept
+{
+    if (!settings_) return;
+    
+    float step = menu_edit_step_float_;
+    float change = static_cast<float>(delta) * step;
+    
+    switch (menu_selected_index_) {
+        case MENU_SEARCH_SPEED: {
+            // bounds_search_velocity_rpm: 0-300 RPM, step 5
+            float new_val = settings_->fatigue_test.bounds_search_velocity_rpm + change;
+            if (new_val < 0.0f) new_val = 0.0f;
+            if (new_val > 300.0f) new_val = 300.0f;
+            settings_->fatigue_test.bounds_search_velocity_rpm = new_val;
+            break;
+        }
+        case MENU_SG_MIN_VEL: {
+            // stallguard_min_velocity_rpm: 0-100 RPM, step 1
+            float new_val = settings_->fatigue_test.stallguard_min_velocity_rpm + change;
+            if (new_val < 0.0f) new_val = 0.0f;
+            if (new_val > 100.0f) new_val = 100.0f;
+            settings_->fatigue_test.stallguard_min_velocity_rpm = new_val;
+            break;
+        }
+        case MENU_CURRENT_FACTOR: {
+            // stall_detection_current_factor: 0.0-1.0, step 0.05
+            float new_val = settings_->fatigue_test.stall_detection_current_factor + change;
+            if (new_val < 0.0f) new_val = 0.0f;
+            if (new_val > 1.0f) new_val = 1.0f;
+            settings_->fatigue_test.stall_detection_current_factor = new_val;
+            break;
+        }
+        case MENU_SEARCH_ACCEL: {
+            // bounds_search_accel_rev_s2: 0-20 rev/s², step 0.5
+            float new_val = settings_->fatigue_test.bounds_search_accel_rev_s2 + change;
+            if (new_val < 0.0f) new_val = 0.0f;
+            if (new_val > 20.0f) new_val = 20.0f;
+            settings_->fatigue_test.bounds_search_accel_rev_s2 = new_val;
+            break;
+        }
+    }
+}
+
 void FatigueTester::toggleCurrentChoice() noexcept
 {
     if (!settings_) return;
     
-    if (menu_selected_index_ == 3) { // Bounds Mode
+    if (menu_selected_index_ == MENU_BOUNDS_MODE) {
         settings_->fatigue_test.bounds_method_stallguard = !settings_->fatigue_test.bounds_method_stallguard;
-    } else if (menu_selected_index_ == 5) { // Flip Screen
+    } else if (menu_selected_index_ == MENU_FLIP_SCREEN) {
         settings_->ui.orientation_flipped = !settings_->ui.orientation_flipped;
         if (display_) {
             display_->setRotation(settings_->ui.orientation_flipped ? 2 : 0);
@@ -710,22 +821,39 @@ void FatigueTester::toggleCurrentChoice() noexcept
 
 void FatigueTester::handleMenuEnter() noexcept
 {
-    if (menu_selected_index_ == 6) { // Back
+    if (menu_selected_index_ == MENU_BACK) {
         menu_active_ = false;
         if (settings_) {
             SettingsStore::Save(*settings_);
             sendSettingsToDevice();
         }
-    } else if (menu_selected_index_ < 3 || menu_selected_index_ == 4) { // Value items
+    } else if (menu_selected_index_ == MENU_CYCLES ||
+               menu_selected_index_ == MENU_TIME_PER_CYCLE ||
+               menu_selected_index_ == MENU_DWELL_TIME ||
+               menu_selected_index_ == MENU_ERROR_SEVERITY) {
+        // Integer value items
         editing_value_ = true;
-        // Set edit parameters based on item
         switch (menu_selected_index_) {
-            case 0: menu_edit_step_ = 100; break; // Cycles
-            case 1: menu_edit_step_ = 1; break;   // Time per cycle
-            case 2: menu_edit_step_ = 1; break;   // Dwell time
-            case 4: menu_edit_step_ = 1; break;   // Error severity
+            case MENU_CYCLES: menu_edit_step_ = 100; break;
+            case MENU_TIME_PER_CYCLE: menu_edit_step_ = 1; break;
+            case MENU_DWELL_TIME: menu_edit_step_ = 1; break;
+            case MENU_ERROR_SEVERITY: menu_edit_step_ = 1; break;
         }
-    } else if (menu_selected_index_ == 3 || menu_selected_index_ == 5) { // Choice items
+    } else if (menu_selected_index_ == MENU_SEARCH_SPEED ||
+               menu_selected_index_ == MENU_SG_MIN_VEL ||
+               menu_selected_index_ == MENU_CURRENT_FACTOR ||
+               menu_selected_index_ == MENU_SEARCH_ACCEL) {
+        // Float value items
+        editing_float_ = true;
+        switch (menu_selected_index_) {
+            case MENU_SEARCH_SPEED: menu_edit_step_float_ = 5.0f; break;
+            case MENU_SG_MIN_VEL: menu_edit_step_float_ = 1.0f; break;
+            case MENU_CURRENT_FACTOR: menu_edit_step_float_ = 0.05f; break;
+            case MENU_SEARCH_ACCEL: menu_edit_step_float_ = 0.5f; break;
+        }
+    } else if (menu_selected_index_ == MENU_BOUNDS_MODE ||
+               menu_selected_index_ == MENU_FLIP_SCREEN) {
+        // Choice items
         editing_choice_ = true;
     }
 }
@@ -747,25 +875,94 @@ void FatigueTester::RenderSettingsMenu() noexcept
     display_->drawLine(0, 9, 128, 9, 1);
     
     if (editing_value_) {
-        // Value edit screen
-        const char* labels[] = {"Cycles", "Time/Cycle", "Dwell Time", "", "Error Severity"};
-        const char* units[] = {"", "s", "s", "", ""};
-        if (menu_selected_index_ < 3 || menu_selected_index_ == 4) {
+        // Integer value edit screen
+        const char* label = "";
+        const char* unit = "";
+        uint32_t val = 0;
+        
+        switch (menu_selected_index_) {
+            case MENU_CYCLES:
+                label = "Cycles";
+                unit = "";
+                val = settings_->fatigue_test.cycle_amount;
+                break;
+            case MENU_TIME_PER_CYCLE:
+                label = "Time/Cycle";
+                unit = "s";
+                val = settings_->fatigue_test.time_per_cycle;
+                break;
+            case MENU_DWELL_TIME:
+                label = "Dwell Time";
+                unit = "s";
+                val = settings_->fatigue_test.dwell_time;
+                break;
+            case MENU_ERROR_SEVERITY:
+                label = "Error Severity";
+                unit = "";
+                val = settings_->fatigue_test.error_severity_min;
+                break;
+        }
+        
             display_->setCursor(0, 20);
-            display_->print(labels[menu_selected_index_]);
+        display_->print(label);
             display_->drawLine(0, 29, 128, 29, 1);
             
             // Large value display
             display_->setTextSize(2);
             char buf[32];
-            uint32_t val = 0;
+        snprintf(buf, sizeof(buf), "%lu%s", (unsigned long)val, unit);
+        int16_t x1, y1;
+        uint16_t w, h;
+        display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+        display_->setCursor((128 - w) / 2, 35);
+        display_->print(buf);
+        
+        display_->setTextSize(1);
+        display_->setCursor(0, 55);
+        display_->print("Rotate: Adjust  OK: Save");
+    } else if (editing_float_) {
+        // Float value edit screen
+        const char* label = "";
+        const char* unit = "";
+        float val = 0.0f;
+        
             switch (menu_selected_index_) {
-                case 0: val = settings_->fatigue_test.cycle_amount; break;
-                case 1: val = settings_->fatigue_test.time_per_cycle; break;
-                case 2: val = settings_->fatigue_test.dwell_time; break;
-                case 4: val = settings_->fatigue_test.error_severity_min; break;
-            }
-            snprintf(buf, sizeof(buf), "%lu%s", (unsigned long)val, units[menu_selected_index_]);
+            case MENU_SEARCH_SPEED:
+                label = "Search Speed";
+                unit = "RPM";
+                val = settings_->fatigue_test.bounds_search_velocity_rpm;
+                break;
+            case MENU_SG_MIN_VEL:
+                label = "SG Min Vel";
+                unit = "RPM";
+                val = settings_->fatigue_test.stallguard_min_velocity_rpm;
+                break;
+            case MENU_CURRENT_FACTOR:
+                label = "Curr Factor";
+                unit = "";
+                val = settings_->fatigue_test.stall_detection_current_factor;
+                break;
+            case MENU_SEARCH_ACCEL:
+                label = "Search Accel";
+                unit = "r/s2";
+                val = settings_->fatigue_test.bounds_search_accel_rev_s2;
+                break;
+        }
+        
+        display_->setCursor(0, 20);
+        display_->print(label);
+        display_->drawLine(0, 29, 128, 29, 1);
+        
+        // Large value display
+        display_->setTextSize(2);
+        char buf[32];
+        if (val == 0.0f) {
+            snprintf(buf, sizeof(buf), "AUTO");  // 0 means use defaults
+        } else if (menu_selected_index_ == MENU_CURRENT_FACTOR) {
+            snprintf(buf, sizeof(buf), "%.2f", val);
+        } else {
+            snprintf(buf, sizeof(buf), "%.0f%s", val, unit);
+        }
             int16_t x1, y1;
             uint16_t w, h;
             display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
@@ -775,7 +972,6 @@ void FatigueTester::RenderSettingsMenu() noexcept
             display_->setTextSize(1);
             display_->setCursor(0, 55);
             display_->print("Rotate: Adjust  OK: Save");
-        }
     } else if (editing_choice_) {
         // Choice edit screen
         const char* label = "";
@@ -783,12 +979,12 @@ void FatigueTester::RenderSettingsMenu() noexcept
         const char* opt1 = "";
         const char* opt2 = "";
         
-        if (menu_selected_index_ == 3) { // Bounds Mode
+        if (menu_selected_index_ == MENU_BOUNDS_MODE) {
             label = "Bounds Mode";
             val_ptr = &settings_->fatigue_test.bounds_method_stallguard;
             opt1 = "[ENC]";
             opt2 = "[STALL]";
-        } else if (menu_selected_index_ == 5) { // Flip Screen
+        } else if (menu_selected_index_ == MENU_FLIP_SCREEN) {
             label = "Flip Screen";
             val_ptr = &settings_->ui.orientation_flipped;
             opt1 = "[NORM]";
@@ -824,23 +1020,26 @@ void FatigueTester::RenderSettingsMenu() noexcept
         display_->setCursor(0, 55);
         display_->print("Rotate: Sel  Push: OK");
     } else {
-        // Menu list
+        // Menu list with scrolling
         const char* menu_items[] = {
             "Cycles",
             "Time/Cycle",
             "Dwell Time",
             "Bounds Mode",
+            "Search Speed",
+            "SG Min Vel",
+            "Curr Factor",
+            "Search Accel",
             "Error Severity",
             "Flip Screen",
             "Back"
         };
         
-        int start_idx = (menu_selected_index_ > 3) ? menu_selected_index_ - 3 : 0;
+        // Calculate scroll window (show 4 items at a time)
+        int start_idx = menu_selected_index_ - 1;
+        if (start_idx < 0) start_idx = 0;
+        if (start_idx > MENU_ITEM_COUNT - 4) start_idx = MENU_ITEM_COUNT - 4;
         int end_idx = start_idx + 4;
-        if (end_idx > 7) {
-            end_idx = 7;
-            start_idx = 3;
-        }
         
         int y = 12;
         for (int i = start_idx; i < end_idx; i++) {
@@ -857,47 +1056,70 @@ void FatigueTester::RenderSettingsMenu() noexcept
             display_->print(menu_items[i]);
             
             // Display value if applicable
-            if (i == 0) { // Cycles
                 char buf[16];
+            const char* str = nullptr;
+            
+            switch (i) {
+                case MENU_CYCLES:
                 snprintf(buf, sizeof(buf), "[%lu]", (unsigned long)settings_->fatigue_test.cycle_amount);
-                int16_t x1, y1;
-                uint16_t w, h;
-                display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-                display_->setCursor(126 - w, y);
-                display_->print(buf);
-            } else if (i == 1) { // Time/Cycle
-                char buf[16];
+                    str = buf;
+                    break;
+                case MENU_TIME_PER_CYCLE:
                 snprintf(buf, sizeof(buf), "[%lus]", (unsigned long)settings_->fatigue_test.time_per_cycle);
-                int16_t x1, y1;
-                uint16_t w, h;
-                display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-                display_->setCursor(126 - w, y);
-                display_->print(buf);
-            } else if (i == 2) { // Dwell Time
-                char buf[16];
+                    str = buf;
+                    break;
+                case MENU_DWELL_TIME:
                 snprintf(buf, sizeof(buf), "[%lus]", (unsigned long)settings_->fatigue_test.dwell_time);
-                int16_t x1, y1;
-                uint16_t w, h;
-                display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-                display_->setCursor(126 - w, y);
-                display_->print(buf);
-            } else if (i == 3) { // Bounds Mode
-                const char* str = settings_->fatigue_test.bounds_method_stallguard ? "[STALL]" : "[ENC]";
-                int16_t x1, y1;
-                uint16_t w, h;
-                display_->getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
-                display_->setCursor(126 - w, y);
-                display_->print(str);
-            } else if (i == 4) { // Error Severity
-                char buf[16];
+                    str = buf;
+                    break;
+                case MENU_BOUNDS_MODE:
+                    str = settings_->fatigue_test.bounds_method_stallguard ? "[SG]" : "[ENC]";
+                    break;
+                case MENU_SEARCH_SPEED:
+                    if (settings_->fatigue_test.bounds_search_velocity_rpm == 0.0f) {
+                        str = "[AUTO]";
+                    } else {
+                        snprintf(buf, sizeof(buf), "[%.0f]", settings_->fatigue_test.bounds_search_velocity_rpm);
+                        str = buf;
+                    }
+                    break;
+                case MENU_SG_MIN_VEL:
+                    if (settings_->fatigue_test.stallguard_min_velocity_rpm == 0.0f) {
+                        str = "[AUTO]";
+                    } else {
+                        snprintf(buf, sizeof(buf), "[%.0f]", settings_->fatigue_test.stallguard_min_velocity_rpm);
+                        str = buf;
+                    }
+                    break;
+                case MENU_CURRENT_FACTOR:
+                    if (settings_->fatigue_test.stall_detection_current_factor == 0.0f) {
+                        str = "[AUTO]";
+                    } else {
+                        snprintf(buf, sizeof(buf), "[%.2f]", settings_->fatigue_test.stall_detection_current_factor);
+                        str = buf;
+                    }
+                    break;
+                case MENU_SEARCH_ACCEL:
+                    if (settings_->fatigue_test.bounds_search_accel_rev_s2 == 0.0f) {
+                        str = "[AUTO]";
+                    } else {
+                        snprintf(buf, sizeof(buf), "[%.1f]", settings_->fatigue_test.bounds_search_accel_rev_s2);
+                        str = buf;
+                    }
+                    break;
+                case MENU_ERROR_SEVERITY:
                 snprintf(buf, sizeof(buf), "[%d]", settings_->fatigue_test.error_severity_min);
-                int16_t x1, y1;
-                uint16_t w, h;
-                display_->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-                display_->setCursor(126 - w, y);
-                display_->print(buf);
-            } else if (i == 5) { // Flip Screen
-                const char* str = settings_->ui.orientation_flipped ? "[FLIP]" : "[NORM]";
+                    str = buf;
+                    break;
+                case MENU_FLIP_SCREEN:
+                    str = settings_->ui.orientation_flipped ? "[FLIP]" : "[NORM]";
+                    break;
+                case MENU_BACK:
+                    // No value for Back
+                    break;
+            }
+            
+            if (str) {
                 int16_t x1, y1;
                 uint16_t w, h;
                 display_->getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
@@ -906,6 +1128,17 @@ void FatigueTester::RenderSettingsMenu() noexcept
             }
             
             y += 12;
+        }
+        
+        // Show scroll indicators
+        display_->setTextColor(1);
+        if (start_idx > 0) {
+            display_->setCursor(120, 12);
+            display_->print("^");
+        }
+        if (end_idx < MENU_ITEM_COUNT) {
+            display_->setCursor(120, 56);
+            display_->print("v");
         }
     }
     

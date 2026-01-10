@@ -44,11 +44,26 @@ private:
         PausedActions    // back/resume/stop
     };
 
+    // Menu item indices
+    static constexpr int MENU_CYCLES = 0;
+    static constexpr int MENU_TIME_PER_CYCLE = 1;
+    static constexpr int MENU_DWELL_TIME = 2;
+    static constexpr int MENU_BOUNDS_MODE = 3;
+    static constexpr int MENU_SEARCH_SPEED = 4;
+    static constexpr int MENU_SG_MIN_VEL = 5;
+    static constexpr int MENU_CURRENT_FACTOR = 6;
+    static constexpr int MENU_SEARCH_ACCEL = 7;
+    static constexpr int MENU_ERROR_SEVERITY = 8;
+    static constexpr int MENU_FLIP_SCREEN = 9;
+    static constexpr int MENU_BACK = 10;
+    static constexpr int MENU_ITEM_COUNT = 11;
+
     // Private functions: camelCase
     void renderStatusScreen() noexcept;
     void handleStatusUpdate(const device_protocols::FatigueTestStatusPayload& status) noexcept;
     void sendSettingsToDevice() noexcept;
     void adjustCurrentValue(int32_t delta) noexcept;
+    void adjustCurrentFloatValue(int32_t delta) noexcept;
     void toggleCurrentChoice() noexcept;
     void handleMenuEnter() noexcept;
     void renderErrorFooter() noexcept;
@@ -75,8 +90,10 @@ private:
     bool menu_active_;
     int menu_selected_index_;
     bool editing_value_;
+    bool editing_float_;
     bool editing_choice_;
     uint32_t menu_edit_step_;
+    float menu_edit_step_float_;
     
     // Error handling
     struct ErrorEntry {
@@ -102,4 +119,3 @@ private:
     // UI feedback on control screen (brief "not connected" flash)
     TickType_t not_connected_flash_until_tick_;
 };
-

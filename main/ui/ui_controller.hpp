@@ -39,6 +39,10 @@ private:
     void renderDeviceControlScreen() noexcept;
     void renderPopup() noexcept;
     
+    // Encoder helper methods
+    void resetEncoderTracking(int32_t position = 0) noexcept;
+    void processEncoderEvents() noexcept;
+    
     // Member variables: snake_case + trailing underscore
     UiState current_state_;
     std::unique_ptr<DeviceBase> current_device_;
@@ -47,5 +51,9 @@ private:
     uint32_t* last_activity_tick_;
     uint8_t selected_device_id_;
     bool popup_active_;
+    
+    // Encoder tracking (moved from Task() local variables for proper state sync)
+    bool last_encoder_button_state_;
+    int32_t last_encoder_pos_;
 };
 
