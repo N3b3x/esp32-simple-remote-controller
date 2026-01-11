@@ -80,3 +80,12 @@
 Thumbs.db
 .vscode/
 .idea/
+
+# Local secrets
+/secrets.local.yml
+
+# Backup / temp files
+*.bak
+*.swp
+*.swo
+*~

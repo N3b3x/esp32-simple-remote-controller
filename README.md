@@ -59,6 +59,14 @@ cd examples/esp32_remote_controller
 ./scripts/build_app.sh remote_controller Release
 ```
 
+### Pairing secret (if enabled)
+
+If secure discovery/pairing is enabled for your target devices, you may need to provide a shared secret:
+
+- Create `secrets.local.yml` using `secrets.template.yml`, and/or
+- Pass `--secret <hex>` to the build script (if supported by your scripts version), and/or
+- Set `ESPNOW_PAIRING_SECRET_HEX` in your environment.
+
 ## Coding Standards
 
 This project follows the coding standards defined in `docs/CODING_STANDARDS.md`:
