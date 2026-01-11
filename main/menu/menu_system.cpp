@@ -28,6 +28,15 @@ void MenuBuilder::AddValueItem(MenuItemBase* parent, const char* label,
     menu_items_.push_back(std::move(item));
 }
 
+void MenuBuilder::AddFloatItem(MenuItemBase* parent, const char* label, 
+                               float* value_ptr, float min_val, 
+                               float max_val, float step) noexcept
+{
+    auto item = std::make_unique<FloatMenuItem>(label, value_ptr, min_val, max_val, step);
+    addItemToParent(parent, item.get());
+    menu_items_.push_back(std::move(item));
+}
+
 void MenuBuilder::AddChoiceItem(MenuItemBase* parent, const char* label, bool* value_ptr) noexcept
 {
     auto item = std::make_unique<ChoiceMenuItem>(label, value_ptr);

@@ -11,8 +11,11 @@
  * @brief Settings structure for fatigue test device.
  * 
  * @details
- * Base settings (cycle_amount, time_per_cycle, dwell_time, bounds_method)
- * are always synchronized with the test unit.
+ * Base settings are always synchronized with the test unit.
+ * 
+ * PROTOCOL V2: Uses direct velocity/acceleration control instead of cycle time.
+ * - oscillation_vmax_rpm: Motor velocity during oscillation (RPM)
+ * - oscillation_amax_rev_s2: Motor acceleration during oscillation (rev/s²)
  * 
  * Extended settings (bounds_search_velocity_rpm, etc.) are optional:
  * - Value of 0.0f means "use test unit's default from test config"
@@ -20,16 +23,20 @@
  */
 struct FatigueTestSettings {
     // Base settings (always synced)
-    uint32_t cycle_amount   = 1000;
-    uint32_t time_per_cycle = 5;    // seconds
-    uint32_t dwell_time     = 1;    // seconds
-    bool     bounds_method_stallguard = true; // true = stallguard, false = encoder
+    uint32_t cycle_amount = 1000;                     // Target cycles (0 = infinite)
+    float    oscillation_vmax_rpm = 60.0f;            // Max velocity during oscillation (RPM)
+    float    oscillation_amax_rev_s2 = 10.0f;         // Acceleration during oscillation (rev/s²)
+    uint32_t dwell_time_ms = 1000;                    // Dwell at endpoints (ms)
+    bool     bounds_method_stallguard = true;         // true = stallguard, false = encoder
     
-    // Extended settings (0.0f = use test unit defaults)
+    // Extended settings for bounds finding (0.0f = use test unit defaults)
     float    bounds_search_velocity_rpm = 0.0f;       // Search speed during bounds finding (RPM)
     float    stallguard_min_velocity_rpm = 0.0f;      // Minimum velocity for StallGuard2 (RPM)
     float    stall_detection_current_factor = 0.0f;   // Current reduction factor (0.0-1.0)
     float    bounds_search_accel_rev_s2 = 0.0f;       // Acceleration during bounds finding (rev/s²)
+
+    // StallGuard threshold (SGT). 127 means "use test unit default".
+    int8_t   stallguard_sgt = 127;
     
     // UI-only settings (not synced to device)
     uint8_t  error_severity_min = 1; // Minimum error severity to display (1=low, 2=medium, 3=high)

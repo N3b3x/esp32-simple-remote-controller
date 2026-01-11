@@ -27,20 +27,28 @@ namespace device_protocols {
  * may not support them. When sending, always send the full structure.
  * When receiving, check the payload length to determine if extended fields
  * are present.
+ * 
+ * PROTOCOL V2: Uses direct velocity/acceleration control instead of cycle time.
  */
 #pragma pack(push, 1)
 struct FatigueTestConfigPayload {
-    // Base fields (13 bytes) - required, always present
-    uint32_t cycle_amount;          ///< Target number of test cycles
-    uint32_t time_per_cycle_sec;    ///< Time per cycle in seconds
-    uint32_t dwell_time_sec;        ///< Dwell time at endpoints in seconds
-    uint8_t  bounds_method;         ///< 0 = StallGuard, 1 = Encoder
+    // Base fields (17 bytes) - required, always present
+    uint32_t cycle_amount;                     ///< Target number of test cycles (0 = infinite)
+    float    oscillation_vmax_rpm;             ///< Max oscillation velocity (RPM) - direct to TMC5160 VMAX
+    float    oscillation_amax_rev_s2;          ///< Oscillation acceleration (rev/s²) - direct to TMC5160 AMAX
+    uint32_t dwell_time_ms;                    ///< Dwell time at endpoints (milliseconds)
+    uint8_t  bounds_method;                    ///< 0 = StallGuard, 1 = Encoder
     
-    // Extended fields (16 bytes) - optional, for advanced configuration
+    // Extended fields (16 bytes) - optional, for bounds finding configuration
     float    bounds_search_velocity_rpm;       ///< Search speed during bounds finding (RPM)
     float    stallguard_min_velocity_rpm;      ///< Minimum velocity threshold for StallGuard2 (RPM)
     float    stall_detection_current_factor;   ///< Current reduction factor (0.0-1.0)
     float    bounds_search_accel_rev_s2;       ///< Acceleration during bounds finding (rev/s²)
+
+    // Extended v2 field (optional)
+    // StallGuard threshold (SGT). Valid range is typically [-64, 63].
+    // 127 means "use test unit default".
+    int8_t   stallguard_sgt;
 };
 
 /**
@@ -86,7 +94,7 @@ enum class FatigueTestCommandId : uint8_t {
 #pragma pack(pop)
 
 // Size constants for payload validation
-static constexpr size_t FATIGUE_TEST_CONFIG_BASE_SIZE = 13;     ///< Base config payload size (without extended fields)
+static constexpr size_t FATIGUE_TEST_CONFIG_BASE_SIZE = 17;     ///< Base config payload size (without extended fields)
 static constexpr size_t FATIGUE_TEST_CONFIG_FULL_SIZE = sizeof(FatigueTestConfigPayload);  ///< Full config payload size
 
 // ============================================================================

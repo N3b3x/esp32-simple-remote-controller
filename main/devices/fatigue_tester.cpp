@@ -2,18 +2,19 @@
  * @file fatigue_tester.cpp
  * @brief Fatigue test device implementation with full menu and screen support
  * 
- * Menu structure (11 items):
+ * Menu structure (12 items) - PROTOCOL V2: velocity/acceleration control
  *   0: Cycles          (uint32, step 100)
- *   1: Time/Cycle      (uint32, step 1)
- *   2: Dwell Time      (uint32, step 1)
- *   3: Bounds Mode     (choice: StallGuard/Encoder)
- *   4: Search Speed    (float RPM, step 5.0)
- *   5: SG Min Vel      (float RPM, step 1.0)
- *   6: Current Factor  (float 0.0-1.0, step 0.05)
- *   7: Search Accel    (float rev/s², step 0.5)
- *   8: Error Severity  (uint8 1-3, step 1)
- *   9: Flip Screen     (choice: Normal/Flipped)
- *  10: Back            (saves and exits)
+ *   1: VMAX            (float RPM, step 5.0) - Max oscillation velocity
+ *   2: AMAX            (float rev/s², step 0.5) - Oscillation acceleration
+ *   3: Dwell Time      (uint32 ms, step 100)
+ *   4: Bounds Mode     (choice: StallGuard/Encoder)
+ *   5: Search Speed    (float RPM, step 5.0)
+ *   6: SG Min Vel      (float RPM, step 1.0)
+ *   7: Current Factor  (float 0.0-1.0, step 0.05)
+ *   8: Search Accel    (float rev/s², step 0.5)
+ *   9: Error Severity  (uint8 1-3, step 1)
+ *  10: Flip Screen     (choice: Normal/Flipped)
+ *  11: Back            (saves and exits)
  */
 
 #include "fatigue_tester.hpp"
@@ -530,8 +531,10 @@ void FatigueTester::UpdateFromProtocol(const espnow::ProtoEvent& event) noexcept
         handleStatusUpdate(status);
     } else if (event.type == espnow::MsgType::ConfigResponse) {
         // Settings received from device - handle both base and extended fields
-        // Minimum payload = base fields (13 bytes)
-        constexpr size_t BASE_CONFIG_SIZE = 13; // 4+4+4+1 = cycle_amount, time_per_cycle, dwell_time, bounds_method
+        // PROTOCOL V2 layout: 17 base bytes, 16 extended bytes, 1 SGT byte
+        constexpr size_t BASE_CONFIG_SIZE = 17; // cycle_amount(4) + vmax(4) + amax(4) + dwell_ms(4) + bounds_method(1)
+        constexpr size_t EXT_CONFIG_V1_SIZE = 17 + (4 * 4); // 33 bytes (4 floats for bounds finding)
+        constexpr size_t EXT_CONFIG_V2_SIZE = EXT_CONFIG_V1_SIZE + 1; // + SGT
         
         if (event.payload_len >= BASE_CONFIG_SIZE) {
             device_protocols::FatigueTestConfigPayload config{};
@@ -547,21 +550,31 @@ void FatigueTester::UpdateFromProtocol(const espnow::ProtoEvent& event) noexcept
                 pushLogLine("CFG rx (menu)");
                 // Don't update settings_ or save - user is editing
             } else if (settings_) {
-                // Base fields (always present)
+                // Base fields (always present) - direct velocity/acceleration control
                 settings_->fatigue_test.cycle_amount = config.cycle_amount;
-                settings_->fatigue_test.time_per_cycle = config.time_per_cycle_sec;
-                settings_->fatigue_test.dwell_time = config.dwell_time_sec;
+                settings_->fatigue_test.oscillation_vmax_rpm = config.oscillation_vmax_rpm;
+                settings_->fatigue_test.oscillation_amax_rev_s2 = config.oscillation_amax_rev_s2;
+                settings_->fatigue_test.dwell_time_ms = config.dwell_time_ms;
                 settings_->fatigue_test.bounds_method_stallguard = (config.bounds_method == 0);
                 
-                // Extended fields (present in newer firmware with full payload)
-                if (event.payload_len >= sizeof(device_protocols::FatigueTestConfigPayload)) {
+                // Extended fields (v1): floats for bounds finding config
+                if (event.payload_len >= EXT_CONFIG_V1_SIZE) {
                     settings_->fatigue_test.bounds_search_velocity_rpm = config.bounds_search_velocity_rpm;
                     settings_->fatigue_test.stallguard_min_velocity_rpm = config.stallguard_min_velocity_rpm;
                     settings_->fatigue_test.stall_detection_current_factor = config.stall_detection_current_factor;
                     settings_->fatigue_test.bounds_search_accel_rev_s2 = config.bounds_search_accel_rev_s2;
-                    ESP_LOGI(TAG_, "Config received with extended fields: search_vel=%.1f, sg_min=%.1f, cur_factor=%.2f, accel=%.1f",
-                             config.bounds_search_velocity_rpm, config.stallguard_min_velocity_rpm,
-                             config.stall_detection_current_factor, config.bounds_search_accel_rev_s2);
+
+                    // Extended v2: SGT
+                    settings_->fatigue_test.stallguard_sgt = 127;
+                    if (event.payload_len >= EXT_CONFIG_V2_SIZE) {
+                        settings_->fatigue_test.stallguard_sgt = config.stallguard_sgt;
+                    }
+
+                    ESP_LOGI(TAG_, "Config: VMAX=%.1f RPM, AMAX=%.1f rev/s², dwell=%lu ms, bounds_vel=%.1f, SGT=%d",
+                             config.oscillation_vmax_rpm, config.oscillation_amax_rev_s2,
+                             (unsigned long)config.dwell_time_ms,
+                             config.bounds_search_velocity_rpm,
+                             static_cast<int>(settings_->fatigue_test.stallguard_sgt));
                 } else {
                     ESP_LOGI(TAG_, "Config received (base fields only, payload_len=%u)", event.payload_len);
                 }
@@ -623,15 +636,20 @@ void FatigueTester::BuildSettingsMenu(class MenuBuilder& builder) noexcept
                         &settings_->fatigue_test.cycle_amount,
                         1, 100000, 100);
     
-    // Time per cycle: 1-3600 seconds, step 1
-    builder.AddValueItem(nullptr, "Time/Cycle",
-                        &settings_->fatigue_test.time_per_cycle,
-                        1, 3600, 1);
+    // Max Velocity (VMAX): 5-120 RPM, step 5
+    builder.AddFloatItem(nullptr, "VMAX (RPM)",
+                        &settings_->fatigue_test.oscillation_vmax_rpm,
+                        5.0f, 120.0f, 5.0f);
     
-    // Dwell time: 0-60 seconds, step 1
-    builder.AddValueItem(nullptr, "Dwell Time",
-                        &settings_->fatigue_test.dwell_time,
-                        0, 60, 1);
+    // Acceleration (AMAX): 0.5-30 rev/s², step 0.5
+    builder.AddFloatItem(nullptr, "AMAX (r/s²)",
+                        &settings_->fatigue_test.oscillation_amax_rev_s2,
+                        0.5f, 30.0f, 0.5f);
+    
+    // Dwell time: 0-10000 ms, step 100
+    builder.AddValueItem(nullptr, "Dwell (ms)",
+                        &settings_->fatigue_test.dwell_time_ms,
+                        0, 10000, 100);
     
     // Bounds method: choice (StallGuard/Encoder)
     builder.AddChoiceItem(nullptr, "Bounds Mode",
@@ -701,23 +719,26 @@ void FatigueTester::sendSettingsToDevice() noexcept
     // Build config payload with all fields including extended ones
     device_protocols::FatigueTestConfigPayload config{};
     
-    // Base fields
+    // Base fields - PROTOCOL V2: direct velocity/acceleration control
     config.cycle_amount = settings_->fatigue_test.cycle_amount;
-    config.time_per_cycle_sec = settings_->fatigue_test.time_per_cycle;
-    config.dwell_time_sec = settings_->fatigue_test.dwell_time;
+    config.oscillation_vmax_rpm = settings_->fatigue_test.oscillation_vmax_rpm;
+    config.oscillation_amax_rev_s2 = settings_->fatigue_test.oscillation_amax_rev_s2;
+    config.dwell_time_ms = settings_->fatigue_test.dwell_time_ms;
     config.bounds_method = settings_->fatigue_test.bounds_method_stallguard ? 0 : 1;
     
-    // Extended fields (0.0f means "use test unit defaults")
+    // Extended fields for bounds finding (0.0f means "use test unit defaults")
     config.bounds_search_velocity_rpm = settings_->fatigue_test.bounds_search_velocity_rpm;
     config.stallguard_min_velocity_rpm = settings_->fatigue_test.stallguard_min_velocity_rpm;
     config.stall_detection_current_factor = settings_->fatigue_test.stall_detection_current_factor;
     config.bounds_search_accel_rev_s2 = settings_->fatigue_test.bounds_search_accel_rev_s2;
+
+    // SGT (127 means "use test unit default")
+    config.stallguard_sgt = settings_->fatigue_test.stallguard_sgt;
     
-    ESP_LOGI(TAG_, "Sending config: cycles=%lu, time=%lu, dwell=%lu, bounds=%s, search_vel=%.1f, sg_min=%.1f, cur_factor=%.2f, accel=%.1f",
-             (unsigned long)config.cycle_amount, (unsigned long)config.time_per_cycle_sec,
-             (unsigned long)config.dwell_time_sec, config.bounds_method == 0 ? "SG" : "ENC",
-             config.bounds_search_velocity_rpm, config.stallguard_min_velocity_rpm,
-             config.stall_detection_current_factor, config.bounds_search_accel_rev_s2);
+    ESP_LOGI(TAG_, "Sending config: cycles=%lu, VMAX=%.1f RPM, AMAX=%.1f rev/s², dwell=%lu ms, bounds=%s",
+             (unsigned long)config.cycle_amount, config.oscillation_vmax_rpm,
+             config.oscillation_amax_rev_s2, (unsigned long)config.dwell_time_ms,
+             config.bounds_method == 0 ? "SG" : "ENC");
     
     espnow::SendConfigSet(GetDeviceId(), &config, sizeof(config));
     settings_synced_ = false;
@@ -735,18 +756,11 @@ void FatigueTester::adjustCurrentValue(int32_t delta) noexcept
             settings_->fatigue_test.cycle_amount = static_cast<uint32_t>(new_val);
             break;
         }
-        case MENU_TIME_PER_CYCLE: {
-            int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.time_per_cycle) + delta;
-            if (new_val < 1) new_val = 1;
-            if (new_val > 3600) new_val = 3600;
-            settings_->fatigue_test.time_per_cycle = static_cast<uint32_t>(new_val);
-            break;
-        }
         case MENU_DWELL_TIME: {
-            int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.dwell_time) + delta;
+            int32_t new_val = static_cast<int32_t>(settings_->fatigue_test.dwell_time_ms) + (delta * 100);
             if (new_val < 0) new_val = 0;
-            if (new_val > 60) new_val = 60;
-            settings_->fatigue_test.dwell_time = static_cast<uint32_t>(new_val);
+            if (new_val > 10000) new_val = 10000;
+            settings_->fatigue_test.dwell_time_ms = static_cast<uint32_t>(new_val);
             break;
         }
         case MENU_ERROR_SEVERITY: {
@@ -767,6 +781,22 @@ void FatigueTester::adjustCurrentFloatValue(int32_t delta) noexcept
     float change = static_cast<float>(delta) * step;
     
     switch (menu_selected_index_) {
+        case MENU_VMAX: {
+            // oscillation_vmax_rpm: 5-120 RPM, step 5
+            float new_val = settings_->fatigue_test.oscillation_vmax_rpm + change;
+            if (new_val < 5.0f) new_val = 5.0f;
+            if (new_val > 120.0f) new_val = 120.0f;
+            settings_->fatigue_test.oscillation_vmax_rpm = new_val;
+            break;
+        }
+        case MENU_AMAX: {
+            // oscillation_amax_rev_s2: 0.5-30 rev/s², step 0.5
+            float new_val = settings_->fatigue_test.oscillation_amax_rev_s2 + change;
+            if (new_val < 0.5f) new_val = 0.5f;
+            if (new_val > 30.0f) new_val = 30.0f;
+            settings_->fatigue_test.oscillation_amax_rev_s2 = new_val;
+            break;
+        }
         case MENU_SEARCH_SPEED: {
             // bounds_search_velocity_rpm: 0-300 RPM, step 5
             float new_val = settings_->fatigue_test.bounds_search_velocity_rpm + change;
@@ -828,24 +858,26 @@ void FatigueTester::handleMenuEnter() noexcept
             sendSettingsToDevice();
         }
     } else if (menu_selected_index_ == MENU_CYCLES ||
-               menu_selected_index_ == MENU_TIME_PER_CYCLE ||
                menu_selected_index_ == MENU_DWELL_TIME ||
                menu_selected_index_ == MENU_ERROR_SEVERITY) {
         // Integer value items
         editing_value_ = true;
         switch (menu_selected_index_) {
             case MENU_CYCLES: menu_edit_step_ = 100; break;
-            case MENU_TIME_PER_CYCLE: menu_edit_step_ = 1; break;
-            case MENU_DWELL_TIME: menu_edit_step_ = 1; break;
+            case MENU_DWELL_TIME: menu_edit_step_ = 100; break;  // ms, step 100
             case MENU_ERROR_SEVERITY: menu_edit_step_ = 1; break;
         }
-    } else if (menu_selected_index_ == MENU_SEARCH_SPEED ||
+    } else if (menu_selected_index_ == MENU_VMAX ||
+               menu_selected_index_ == MENU_AMAX ||
+               menu_selected_index_ == MENU_SEARCH_SPEED ||
                menu_selected_index_ == MENU_SG_MIN_VEL ||
                menu_selected_index_ == MENU_CURRENT_FACTOR ||
                menu_selected_index_ == MENU_SEARCH_ACCEL) {
         // Float value items
         editing_float_ = true;
         switch (menu_selected_index_) {
+            case MENU_VMAX: menu_edit_step_float_ = 5.0f; break;
+            case MENU_AMAX: menu_edit_step_float_ = 0.5f; break;
             case MENU_SEARCH_SPEED: menu_edit_step_float_ = 5.0f; break;
             case MENU_SG_MIN_VEL: menu_edit_step_float_ = 1.0f; break;
             case MENU_CURRENT_FACTOR: menu_edit_step_float_ = 0.05f; break;
@@ -886,15 +918,10 @@ void FatigueTester::RenderSettingsMenu() noexcept
                 unit = "";
                 val = settings_->fatigue_test.cycle_amount;
                 break;
-            case MENU_TIME_PER_CYCLE:
-                label = "Time/Cycle";
-                unit = "s";
-                val = settings_->fatigue_test.time_per_cycle;
-                break;
             case MENU_DWELL_TIME:
                 label = "Dwell Time";
-                unit = "s";
-                val = settings_->fatigue_test.dwell_time;
+                unit = "ms";
+                val = settings_->fatigue_test.dwell_time_ms;
                 break;
             case MENU_ERROR_SEVERITY:
                 label = "Error Severity";
@@ -925,27 +952,42 @@ void FatigueTester::RenderSettingsMenu() noexcept
         const char* label = "";
         const char* unit = "";
         float val = 0.0f;
+        bool is_auto_zero = false;  // For bounds config fields, 0 = use defaults
         
-            switch (menu_selected_index_) {
+        switch (menu_selected_index_) {
+            case MENU_VMAX:
+                label = "VMAX";
+                unit = "RPM";
+                val = settings_->fatigue_test.oscillation_vmax_rpm;
+                break;
+            case MENU_AMAX:
+                label = "AMAX";
+                unit = "r/s2";
+                val = settings_->fatigue_test.oscillation_amax_rev_s2;
+                break;
             case MENU_SEARCH_SPEED:
                 label = "Search Speed";
                 unit = "RPM";
                 val = settings_->fatigue_test.bounds_search_velocity_rpm;
+                is_auto_zero = true;
                 break;
             case MENU_SG_MIN_VEL:
                 label = "SG Min Vel";
                 unit = "RPM";
                 val = settings_->fatigue_test.stallguard_min_velocity_rpm;
+                is_auto_zero = true;
                 break;
             case MENU_CURRENT_FACTOR:
                 label = "Curr Factor";
                 unit = "";
                 val = settings_->fatigue_test.stall_detection_current_factor;
+                is_auto_zero = true;
                 break;
             case MENU_SEARCH_ACCEL:
                 label = "Search Accel";
                 unit = "r/s2";
                 val = settings_->fatigue_test.bounds_search_accel_rev_s2;
+                is_auto_zero = true;
                 break;
         }
         
@@ -956,10 +998,12 @@ void FatigueTester::RenderSettingsMenu() noexcept
         // Large value display
         display_->setTextSize(2);
         char buf[32];
-        if (val == 0.0f) {
+        if (is_auto_zero && val == 0.0f) {
             snprintf(buf, sizeof(buf), "AUTO");  // 0 means use defaults
         } else if (menu_selected_index_ == MENU_CURRENT_FACTOR) {
             snprintf(buf, sizeof(buf), "%.2f", val);
+        } else if (menu_selected_index_ == MENU_AMAX) {
+            snprintf(buf, sizeof(buf), "%.1f%s", val, unit);
         } else {
             snprintf(buf, sizeof(buf), "%.0f%s", val, unit);
         }
@@ -1020,11 +1064,12 @@ void FatigueTester::RenderSettingsMenu() noexcept
         display_->setCursor(0, 55);
         display_->print("Rotate: Sel  Push: OK");
     } else {
-        // Menu list with scrolling
+        // Menu list with scrolling - PROTOCOL V2: velocity/acceleration control
         const char* menu_items[] = {
             "Cycles",
-            "Time/Cycle",
-            "Dwell Time",
+            "VMAX (RPM)",
+            "AMAX (r/s2)",
+            "Dwell (ms)",
             "Bounds Mode",
             "Search Speed",
             "SG Min Vel",
@@ -1061,15 +1106,19 @@ void FatigueTester::RenderSettingsMenu() noexcept
             
             switch (i) {
                 case MENU_CYCLES:
-                snprintf(buf, sizeof(buf), "[%lu]", (unsigned long)settings_->fatigue_test.cycle_amount);
+                    snprintf(buf, sizeof(buf), "[%lu]", (unsigned long)settings_->fatigue_test.cycle_amount);
                     str = buf;
                     break;
-                case MENU_TIME_PER_CYCLE:
-                snprintf(buf, sizeof(buf), "[%lus]", (unsigned long)settings_->fatigue_test.time_per_cycle);
+                case MENU_VMAX:
+                    snprintf(buf, sizeof(buf), "[%.0f]", settings_->fatigue_test.oscillation_vmax_rpm);
+                    str = buf;
+                    break;
+                case MENU_AMAX:
+                    snprintf(buf, sizeof(buf), "[%.1f]", settings_->fatigue_test.oscillation_amax_rev_s2);
                     str = buf;
                     break;
                 case MENU_DWELL_TIME:
-                snprintf(buf, sizeof(buf), "[%lus]", (unsigned long)settings_->fatigue_test.dwell_time);
+                    snprintf(buf, sizeof(buf), "[%lu]", (unsigned long)settings_->fatigue_test.dwell_time_ms);
                     str = buf;
                     break;
                 case MENU_BOUNDS_MODE:

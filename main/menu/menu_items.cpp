@@ -154,3 +154,62 @@ bool ActionMenuItem::HandleRotation(EC11Encoder::Direction direction) noexcept
     return false;
 }
 
+FloatMenuItem::FloatMenuItem(const char* label, float* value_ptr, 
+                             float min_val, float max_val, float step) noexcept
+    : MenuItemBase(label, nullptr)
+    , value_ptr_(value_ptr)
+    , min_val_(min_val)
+    , max_val_(max_val)
+    , step_(step)
+    , editing_(false)
+{
+}
+
+const char* FloatMenuItem::GetLabel() const noexcept
+{
+    return label_;
+}
+
+void FloatMenuItem::Render(int y_position, bool is_selected) noexcept
+{
+    (void)y_position;
+    (void)is_selected;
+    (void)label_;
+    (void)value_ptr_;
+    (void)editing_;
+    // TODO: Implement rendering
+}
+
+bool FloatMenuItem::HandleEnter() noexcept
+{
+    editing_ = !editing_;
+    return true;
+}
+
+bool FloatMenuItem::HandleRotation(EC11Encoder::Direction direction) noexcept
+{
+    if (editing_) {
+        adjustValue(direction == EC11Encoder::Direction::CW ? step_ : -step_);
+        return true;
+    }
+    return false;
+}
+
+void FloatMenuItem::adjustValue(float delta) noexcept
+{
+    if (!value_ptr_) return;
+    
+    float new_value = *value_ptr_ + delta;
+    if (new_value < min_val_) {
+        new_value = min_val_;
+    } else if (new_value > max_val_) {
+        new_value = max_val_;
+    }
+    *value_ptr_ = new_value;
+}
+
+void FloatMenuItem::saveValue() noexcept
+{
+    editing_ = false;
+}
+

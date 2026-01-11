@@ -81,3 +81,25 @@ private:
     ActionCallback callback_;
 };
 
+class FloatMenuItem : public MenuItemBase {
+public:
+    FloatMenuItem(const char* label, float* value_ptr, 
+                  float min_val, float max_val, float step) noexcept;
+    const char* GetLabel() const noexcept override;
+    void Render(int y_position, bool is_selected) noexcept override;
+    bool HandleEnter() noexcept override;
+    bool HandleRotation(EC11Encoder::Direction direction) noexcept override;
+    
+private:
+    // Private functions: camelCase
+    void adjustValue(float delta) noexcept;
+    void saveValue() noexcept;
+    
+    // Member variables: snake_case + trailing underscore
+    float* value_ptr_;
+    float min_val_;
+    float max_val_;
+    float step_;
+    bool editing_;
+};
+

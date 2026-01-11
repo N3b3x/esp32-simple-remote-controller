@@ -44,19 +44,20 @@ private:
         PausedActions    // back/resume/stop
     };
 
-    // Menu item indices
+    // Menu item indices - PROTOCOL V2: velocity/acceleration control
     static constexpr int MENU_CYCLES = 0;
-    static constexpr int MENU_TIME_PER_CYCLE = 1;
-    static constexpr int MENU_DWELL_TIME = 2;
-    static constexpr int MENU_BOUNDS_MODE = 3;
-    static constexpr int MENU_SEARCH_SPEED = 4;
-    static constexpr int MENU_SG_MIN_VEL = 5;
-    static constexpr int MENU_CURRENT_FACTOR = 6;
-    static constexpr int MENU_SEARCH_ACCEL = 7;
-    static constexpr int MENU_ERROR_SEVERITY = 8;
-    static constexpr int MENU_FLIP_SCREEN = 9;
-    static constexpr int MENU_BACK = 10;
-    static constexpr int MENU_ITEM_COUNT = 11;
+    static constexpr int MENU_VMAX = 1;           // Max velocity (RPM)
+    static constexpr int MENU_AMAX = 2;           // Acceleration (rev/s²)
+    static constexpr int MENU_DWELL_TIME = 3;     // Dwell time (ms)
+    static constexpr int MENU_BOUNDS_MODE = 4;
+    static constexpr int MENU_SEARCH_SPEED = 5;
+    static constexpr int MENU_SG_MIN_VEL = 6;
+    static constexpr int MENU_CURRENT_FACTOR = 7;
+    static constexpr int MENU_SEARCH_ACCEL = 8;
+    static constexpr int MENU_ERROR_SEVERITY = 9;
+    static constexpr int MENU_FLIP_SCREEN = 10;
+    static constexpr int MENU_BACK = 11;
+    static constexpr int MENU_ITEM_COUNT = 12;
 
     // Private functions: camelCase
     void renderStatusScreen() noexcept;
