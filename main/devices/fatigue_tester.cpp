@@ -954,7 +954,7 @@ void FatigueTester::RenderSettingsMenu() noexcept
         float val = 0.0f;
         bool is_auto_zero = false;  // For bounds config fields, 0 = use defaults
         
-        switch (menu_selected_index_) {
+            switch (menu_selected_index_) {
             case MENU_VMAX:
                 label = "VMAX";
                 unit = "RPM";
@@ -1106,7 +1106,7 @@ void FatigueTester::RenderSettingsMenu() noexcept
             
             switch (i) {
                 case MENU_CYCLES:
-                    snprintf(buf, sizeof(buf), "[%lu]", (unsigned long)settings_->fatigue_test.cycle_amount);
+                snprintf(buf, sizeof(buf), "[%lu]", (unsigned long)settings_->fatigue_test.cycle_amount);
                     str = buf;
                     break;
                 case MENU_VMAX:
